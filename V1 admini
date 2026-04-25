@@ -267,6 +267,79 @@ function processMessage_(message) {
   };
 }
 
+
+/**
+ * Détermine si un e-mail peut être exclu de manière fiable.
+ * Exclut : newsletters, publicités, alertes emploi Indeed, notifications Google,
+ * invitations calendrier.
+ * N’exclut jamais : Cerfrance, Enedis, Wecasa, Airbnb, Banque, TVA, facture,
+ * justificatif.
+ *
+ * @param {string} from
+ * @param {string} to
+ * @param {string} subject
+ * @param {string} bodyPreview
+ * @return {{excluded: boolean, rule: string}}
+ */
+function isClearlyExcluded_(from, to, subject, bodyPreview) {
+  var lowFrom = (from || '').toLowerCase();
+  var lowTo = (to || '').toLowerCase();
+  var lowSub = (subject || '').toLowerCase();
+  var lowBody = (bodyPreview || '').toLowerCase();
+  var haystack = [lowFrom, lowTo, lowSub, lowBody].join(' ');
+
+  // Garde-fous : si un indicateur critique est trouvé, ne pas exclure.
+  var neverExcludePatterns = [
+    'cerfrance',
+    'alliancecomtoise.cerfrance.fr',
+    'enedis',
+    'wecasa',
+    'airbnb',
+    'banque',
+    'credit agricole',
+    'crédit agricole',
+    'societe generale',
+    'société générale',
+    'bnp',
+    'lcl',
+    'caisse d\'epargne',
+    'caisse d\'épargne',
+    'tva',
+    'urssaf',
+    'impôt',
+    'impot',
+    'facture',
+    'invoice',
+    'justificatif',
+    'reçu',
+    'recu'
+  ];
+  for (var i = 0; i < neverExcludePatterns.length; i++) {
+    if (haystack.indexOf(neverExcludePatterns[i]) !== -1) {
+      return { excluded: false, rule: '' };
+    }
+  }
+
+  var exclusionRules = [
+    { rule: 'EXCL_NEWSLETTER', patterns: ['newsletter', 'unsubscribe', 'se désabonner', 'se desabonner', 'désinscription', 'desinscription'] },
+    { rule: 'EXCL_PUBLICITE', patterns: ['publicité', 'publicite', 'promo', 'promotion', 'offre spéciale', 'offre speciale', 'soldes', 'black friday'] },
+    { rule: 'EXCL_INDEED_JOB_ALERT', patterns: ['indeed', 'job alert', 'alerte emploi', 'nouveaux emplois', 'votre alerte emploi'] },
+    { rule: 'EXCL_GOOGLE_NOTIFICATION', patterns: ['google alerts', 'google account', 'security alert', 'alerte de sécurité', 'alerte de securite', 'google no-reply', 'no-reply@google.com', 'accounts.google.com'] },
+    { rule: 'EXCL_CALENDAR_INVITE', patterns: ['invite.ics', 'invitation calendrier', 'calendar invite', 'google calendar', 'microsoft teams', 'teams meeting', 'join the meeting', 'réunion teams', 'reunion teams'] }
+  ];
+
+  for (var r = 0; r < exclusionRules.length; r++) {
+    var rule = exclusionRules[r];
+    for (var p = 0; p < rule.patterns.length; p++) {
+      if (haystack.indexOf(rule.patterns[p]) !== -1) {
+        return { excluded: true, rule: rule.rule };
+      }
+    }
+  }
+
+  return { excluded: false, rule: '' };
+}
+
 /**
  * Détermine la classification d’un e‑mail à partir de son expéditeur, de son objet
  * et d’un aperçu de son corps. Les règles sont simplistes et peuvent être améliorées.
@@ -292,28 +365,13 @@ function classifyEmail_(from, to, subject, bodyPreview) {
     action: ''
   };
 
-  // Exclusions évidentes : newsletters, Upmeet, Teams invites, etc.
-  var exclusionPatterns = [
-    'upmeet',
-    'invite.ics',
-    'microsoft teams',
-    'teams',
-    'calendar',
-    'newsletter',
-    'licitor',
-    'cas d\'usage',
-    'analyse rh',
-    'nomination',
-    'congé payé',
-    'vacation',
-    '@licitor.com'
-  ];
-  for (var i = 0; i < exclusionPatterns.length; i++) {
-    if (lowSub.indexOf(exclusionPatterns[i]) !== -1 || lowFrom.indexOf(exclusionPatterns[i]) !== -1) {
-      classification.status = 'Exclu';
-      classification.rule = 'exclusion_' + exclusionPatterns[i];
-      return classification;
-    }
+  // Exclusions évidentes : newsletters, publicités, notifications, invitations calendrier.
+  // IMPORTANT : ne jamais exclure les mails comptables/administratifs critiques.
+  var exclusionResult = isClearlyExcluded_(from, to, subject, bodyPreview);
+  if (exclusionResult && exclusionResult.excluded) {
+    classification.status = 'Exclu';
+    classification.rule = exclusionResult.rule || 'EXCLUSION_RULE';
+    return classification;
   }
 
   // Règles prioritaires pour le solaire (Enedis, iSolarCloud, BFC, OA)
