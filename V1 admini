@@ -44,9 +44,9 @@ var PROCESSING_CONFIG = {
    * Libellés Gmail utilisés pour suivre l’état des mails. Les mails déjà traités
    * (traités ou à vérifier) sont marqués pour éviter d’être re‑analysés.
    */
-  LABEL_TREATED: 'Compta_Admin_Traité',
-  LABEL_TO_VERIFY: 'Compta_Admin_A_Verifier',
-  LABEL_EXCLUDED: 'Compta_Admin_Exclu'
+  LABEL_TREATED: 'Compta_Admin_Traité_V3',
+  LABEL_TO_VERIFY: 'Compta_Admin_A_Verifier_V3',
+  LABEL_EXCLUDED: 'Compta_Admin_Exclu_V3'
 };
 
 /**
@@ -187,83 +187,132 @@ function buildGmailQuery_(lastRunDate) {
  * @return {Object|null}
  */
 function processMessage_(message) {
-  var from = message.getFrom() || '';
-  var to = (message.getTo() || '') + '\n' + (message.getCc() || '') + '\n' + (message.getBcc() || '');
-  var subject = message.getSubject() || '';
-  var date = message.getDate();
-  var attachments = message.getAttachments({ includeInlineImages: false, includeAttachments: true });
-  var bodyPreview = (message.getPlainBody() || '').substring(0, 1000);
+  var now = new Date();
 
-  // Classification
-  var classification = classifyEmail_(from, to, subject, bodyPreview);
+  var from = message.getFrom() || "";
+  var to = message.getTo() || "";
+  var cc = message.getCc() || "";
+  var bcc = message.getBcc() || "";
+  var recipients = [to, cc, bcc].filter(Boolean).join("\n");
 
-  // Exclusion immédiate
-  if (classification.status === 'Exclu') {
-    return { status: 'Exclu' };
-  }
+  var subject = message.getSubject() || "";
+  var dateMail = message.getDate();
+  var body = message.getPlainBody() || "";
+  var bodyPreview = body.substring(0, 1200);
 
-  // Si aucune pièce jointe utile trouvée et pas de contenu comptable évident, classer en À vérifier
-  var relevantAttachments = [];
-  attachments.forEach(function(att) {
-    var filename = att.getName();
-    var ext = getExtension_(filename);
-    // Autoriser uniquement les extensions usuelles
-    var allowedExt = ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'csv', 'jpg', 'jpeg', 'png'];
-    if (allowedExt.indexOf(ext) !== -1) {
-      relevantAttachments.push(att);
-    }
+  var attachments = message.getAttachments({
+    includeInlineImages: false,
+    includeAttachments: true
   });
 
-  // Si aucune PJ utile et pas de mots clés comptables dans le sujet ou le corps
-  if (relevantAttachments.length === 0 && classification.activity === '' && classification.category === '') {
-    classification.status = 'À vérifier';
-    classification.action = 'Vérifier le classement de cet e-mail (pas de pièce jointe comptable détectée)';
-  }
+  var relevantAttachments = getRelevantAttachments_(attachments);
+  var attachmentSummary = getAttachmentSummary_(relevantAttachments);
 
-  // Préparer la ligne document
-  var documentRow = [
-    Utilities.formatDate(date, Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss'),
+  var direction = detectMailDirection_(from, recipients);
+
+  var classification = classifyEmail_(
     from,
+    recipients,
     subject,
-    relevantAttachments.map(function(a) { return a.getName(); }).join('\n'),
-    classification.entity,
-    classification.activity,
-    classification.category,
-    classification.dossier,
-    classification.status,
-    classification.confiance,
-    classification.rule,
-    classification.action || '',
-    message.getId(),
-    message.getThread().getId()
-  ];
+    bodyPreview,
+    attachmentSummary.names
+  );
 
-  // Préparer la ligne d’action si besoin
-  var actionRow = null;
-  if (classification.status === 'À vérifier' || classification.action) {
-    actionRow = [
-      Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss'),
-      'Gmail',
-      classification.entity,
-      classification.activity,
-      classification.category,
-      classification.action || 'Vérifier',
-      'Moyenne',
-      message.getId(),
-      message.getThread().getId(),
-      classification.status
-    ];
+  if (!classification) {
+    return null;
   }
 
-  // Si mode actif et statut A extraire, sauvegarder les PJ dans Drive
-  if (!PROCESSING_CONFIG.MODE_TEST && classification.status !== 'Exclu' && relevantAttachments.length > 0) {
-    saveAttachmentsToDrive_(relevantAttachments, date, from, subject, classification.dossier);
+  if (classification.status === "Exclu") {
+    return {
+      status: "Exclu",
+      documentRow: null,
+      actionRow: null
+    };
+  }
+
+  /*
+   * Cas important :
+   * Si aucun document utile, aucun mot-clé comptable/admin, et aucune règle forte,
+   * on exclut pour éviter de polluer le Sheet.
+   */
+  if (
+    relevantAttachments.length === 0 &&
+    classification.rule === "DEFAULT_NON_UTILE"
+  ) {
+    return {
+      status: "Exclu",
+      documentRow: null,
+      actionRow: null
+    };
+  }
+
+  /*
+   * Si une pièce jointe utile existe mais que le classement n'est pas sûr,
+   * on garde en À vérifier.
+   */
+  if (
+    relevantAttachments.length > 0 &&
+    classification.rule === "DEFAULT_A_VERIFIER"
+  ) {
+    classification.status = "À vérifier";
+    classification.action = "Examiner cet e-mail et ses pièces jointes pour déterminer le classement.";
+  }
+
+  /*
+   * En mode test, on ne sauvegarde pas dans Drive.
+   * En mode réel, on extrait seulement les pièces jointes utiles et non exclues.
+   */
+  var driveLinks = "";
+  if (
+    !PROCESSING_CONFIG.MODE_TEST &&
+    classification.status !== "Exclu" &&
+    relevantAttachments.length > 0 &&
+    classification.dossier
+  ) {
+    driveLinks = saveAttachmentsToDrive_(
+      relevantAttachments,
+      dateMail,
+      from,
+      subject,
+      classification.dossier
+    ) || "";
+  }
+
+  var documentRow = buildDocumentRow_({
+    message: message,
+    now: now,
+    dateMail: dateMail,
+    direction: direction,
+    from: from,
+    recipients: recipients,
+    subject: subject,
+    bodyPreview: bodyPreview,
+    attachments: relevantAttachments,
+    attachmentSummary: attachmentSummary,
+    classification: classification,
+    driveLinks: driveLinks
+  });
+
+  var actionRow = null;
+
+  if (
+    classification.status === "À vérifier" ||
+    classification.createAction === true ||
+    classification.action
+  ) {
+    actionRow = buildActionRow_({
+      message: message,
+      now: now,
+      documentId: message.getId(),
+      classification: classification,
+      driveLinks: driveLinks
+    });
   }
 
   return {
+    status: classification.status,
     documentRow: documentRow,
-    actionRow: actionRow,
-    status: classification.status
+    actionRow: actionRow
   };
 }
 
@@ -276,199 +325,409 @@ function processMessage_(message) {
  * @param {string} bodyPreview
  * @return {Object} classification
  */
-function classifyEmail_(from, to, subject, bodyPreview) {
-  var lowFrom = from.toLowerCase();
-  var lowSub = subject.toLowerCase();
-  var lowBody = bodyPreview.toLowerCase();
+function classifyEmail_(from, recipients, subject, bodyPreview, attachmentNames) {
+  var lowFrom = normalizeText_(from);
+  var lowRecipients = normalizeText_(recipients);
+  var lowSubject = normalizeText_(subject);
+  var lowBody = normalizeText_(bodyPreview);
+  var lowAttachments = normalizeText_(attachmentNames || "");
+
+  var all = [
+    lowFrom,
+    lowRecipients,
+    lowSubject,
+    lowBody,
+    lowAttachments
+  ].join(" ");
 
   var classification = {
-    entity: '',
-    activity: '',
-    category: '',
-    dossier: '',
-    status: 'À extraire',
-    confiance: 'Moyenne',
-    rule: '',
-    action: ''
+    entity: "",
+    activity: "",
+    category: "",
+    dossier: "",
+    dossierExistantProbable: "",
+    status: "À vérifier",
+    confiance: "Faible",
+    rule: "DEFAULT_A_VERIFIER",
+    decisionIA: "",
+    action: "Examiner cet e-mail manuellement pour déterminer son classement.",
+    createAction: true,
+    priority: "Moyenne",
+    typeAction: "Vérifier classement",
+    dejaTransmisComptable: "Non",
+    doublonProbable: "Non",
+    comment: ""
   };
 
-  // Exclusions évidentes : newsletters, Upmeet, Teams invites, etc.
-  var exclusionPatterns = [
-    'upmeet',
-    'invite.ics',
-    'microsoft teams',
-    'teams',
-    'calendar',
-    'newsletter',
-    'licitor',
-    'cas d\'usage',
-    'analyse rh',
-    'nomination',
-    'congé payé',
-    'vacation',
-    '@licitor.com'
-  ];
-  for (var i = 0; i < exclusionPatterns.length; i++) {
-    if (lowSub.indexOf(exclusionPatterns[i]) !== -1 || lowFrom.indexOf(exclusionPatterns[i]) !== -1) {
-      classification.status = 'Exclu';
-      classification.rule = 'exclusion_' + exclusionPatterns[i];
-      return classification;
+  /*
+   * 1. Exclusions évidentes.
+   * Objectif : ne pas polluer 01_Documents et 02_Actions avec les newsletters,
+   * alertes commerciales, réseaux sociaux, notifications techniques sans enjeu comptable.
+   */
+  if (isClearlyExcluded_(lowFrom, lowRecipients, lowSubject, lowBody, lowAttachments)) {
+    classification.status = "Exclu";
+    classification.confiance = "Forte";
+    classification.rule = "EXCLUSION_BRUIT";
+    classification.action = "";
+    classification.createAction = false;
+    return classification;
+  }
+
+  /*
+   * 2. CERFRANCE / comptables.
+   * Important : on regarde expéditeur ET destinataires,
+   * car certains mails importants sont envoyés par toi vers Valentine ou Sylvain.
+   */
+  if (
+    containsAny_(all, [
+      "cerfrance",
+      "alliancecomtoise",
+      "alliance comtoise",
+      "vbardoux",
+      "valentine bardoux",
+      "sligey",
+      "sylvain ligey"
+    ])
+  ) {
+    classification.entity = "SAS";
+    classification.activity = "Comptable";
+    classification.category = "Échanges comptables";
+    classification.dossier = buildSasDossierPath_("06_Bilan_Comptable");
+    classification.status = "À vérifier";
+    classification.confiance = "Forte";
+    classification.rule = "CERFRANCE_COMPTABLE";
+    classification.typeAction = "Vérifier classement";
+    classification.action = "Vérifier le mail Cerfrance et classer les pièces jointes ou demandes associées.";
+    classification.createAction = true;
+
+    if (isSentToComptable_(lowRecipients)) {
+      classification.dejaTransmisComptable = "Oui";
+      classification.action = "Vérifier que les pièces transmises au comptable sont bien complètes.";
     }
-  }
 
-  // Règles prioritaires pour le solaire (Enedis, iSolarCloud, BFC, OA)
-  if (lowFrom.indexOf('enedis-noreply') !== -1 && lowSub.indexOf('facture') !== -1) {
-    // Facture Enedis production
-    classification.entity = 'SAS';
-    classification.activity = 'Solaire';
-    classification.category = 'Facture';
-    classification.dossier = buildSasDossierPath_('01_Solaire/Enedis_Factures');
-    classification.rule = 'ENEDIS_FACTURE';
-    classification.confiance = 'Forte';
-    return classification;
-  }
-  if (lowFrom.indexOf('afc-agence prod') !== -1 || lowSub.indexOf('publication semestrielle') !== -1) {
-    // Publication semestrielle de données de comptage
-    classification.entity = 'SAS';
-    classification.activity = 'Solaire';
-    classification.category = 'Données de comptage';
-    classification.dossier = buildSasDossierPath_('01_Solaire/Enedis_Comptage');
-    classification.rule = 'ENEDIS_COMPTAGE';
-    classification.confiance = 'Forte';
-    return classification;
-  }
-  if (lowFrom.indexOf('isolarcloud') !== -1) {
-    classification.entity = 'SAS';
-    classification.activity = 'Solaire';
-    classification.category = 'Contrat';
-    classification.dossier = buildSasDossierPath_('01_Solaire/iSolarCloud');
-    classification.rule = 'ISOLARCLOUD';
-    classification.confiance = 'Moyenne';
-    return classification;
-  }
-  if (lowFrom.indexOf('oa-solaire') !== -1 || lowSub.indexOf('obligation d\'achat') !== -1) {
-    classification.entity = 'SAS';
-    classification.activity = 'Solaire';
-    classification.category = 'OA';
-    classification.dossier = buildSasDossierPath_('01_Solaire/EDF_OA');
-    classification.rule = 'OA_SOLAIRE';
-    classification.confiance = 'Moyenne';
-    return classification;
-  }
-  if (lowFrom.indexOf('bfc') !== -1 && lowSub.indexOf('solaire') !== -1) {
-    classification.entity = 'SAS';
-    classification.activity = 'Solaire';
-    classification.category = 'BFC';
-    classification.dossier = buildSasDossierPath_('01_Solaire/BFC_Solaire');
-    classification.rule = 'BFC_SOLAIRE';
-    classification.confiance = 'Moyenne';
-    return classification;
-  }
-
-  // AirBnB / Wecasa / Locations personnelles
-  if (lowFrom.indexOf('wecasa') !== -1) {
-    classification.entity = 'Perso_Locations';
-    classification.activity = 'Airbnb_Aubervilliers';
-    classification.category = 'Frais_Ménage';
-    classification.dossier = buildPersoLocationDossierPath_('01_Airbnb_Aubervilliers/Frais_Ménage_Wecasa');
-    classification.rule = 'WECASA_AUBERVILLIERS';
-    classification.confiance = 'Forte';
-    return classification;
-  }
-  if (lowFrom.indexOf('airbnb') !== -1 || lowSub.indexOf('airbnb') !== -1) {
-    // Déterminer Aubervilliers ou Annoire en fonction du contenu
-    if (lowSub.indexOf('aubervilliers') !== -1) {
-      classification.entity = 'Perso_Locations';
-      classification.activity = 'Airbnb_Aubervilliers';
-      classification.category = 'Réservation';
-      classification.dossier = buildPersoLocationDossierPath_('01_Airbnb_Aubervilliers/Airbnb_Réservations');
-    } else if (lowSub.indexOf('annoire') !== -1) {
-      classification.entity = 'Perso_Locations';
-      classification.activity = 'Airbnb_Annoire';
-      classification.category = 'Réservation';
-      classification.dossier = buildPersoLocationDossierPath_('02_Airbnb_Annoire/Airbnb_Réservations');
-    } else {
-      classification.entity = 'Perso_Locations';
-      classification.activity = 'Airbnb';
-      classification.category = 'Réservation';
-      classification.dossier = buildPersoLocationDossierPath_('01_Airbnb_Aubervilliers/Airbnb_Réservations');
-      classification.status = 'À vérifier';
-      classification.action = 'Confirmer si Airbnb concerne Aubervilliers ou Annoire';
-      classification.confiance = 'Faible';
+    if (
+      containsAny_(all, ["tva", "taxe sur la valeur ajoutee", "1er trimestre", "trimestre 2026"])
+    ) {
+      classification.activity = "Fiscalité";
+      classification.category = "TVA";
+      classification.dossier = buildSasDossierPath_("03_TVA_Impots");
+      classification.rule = "CERFRANCE_TVA";
+      classification.action = "Vérifier la demande TVA Cerfrance et rattacher les justificatifs nécessaires.";
     }
-    classification.rule = 'AIRBNB';
+
+    if (
+      containsAny_(all, ["releve", "relevé", "56532309650", "sas bigueure brothers", "compte courant"])
+    ) {
+      classification.activity = "Banque";
+      classification.category = "Relevé bancaire SAS";
+      classification.dossier = buildSasDossierPath_("04_Banque_Paiements");
+      classification.rule = "CERFRANCE_RELEVE_BANCAIRE_SAS";
+      classification.action = "Vérifier les relevés bancaires SAS transmis au comptable.";
+    }
+
     return classification;
   }
 
-  // TVA et Impôts SAS (mots-clés dans le sujet)
-  var tvaKeywords = ['tva', 'taxe', 'urssaf', 'impôt', 'impot', 'cotisation'];
-  for (var j = 0; j < tvaKeywords.length; j++) {
-    if (lowSub.indexOf(tvaKeywords[j]) !== -1) {
-      classification.entity = 'SAS';
-      classification.activity = 'Fiscalité';
-      classification.category = 'TVA/Impôts/Charges';
-      classification.dossier = buildSasDossierPath_('03_TVA_Impots');
-      classification.rule = 'FISCALITE';
-      classification.confiance = 'Moyenne';
-      return classification;
-    }
-  }
+  /*
+   * 3. Solaire / SAS.
+   */
+  if (
+    containsAny_(all, [
+      "enedis-noreply",
+      "enedis",
+      "contrat production",
+      "facture enedis",
+      "publication semestrielle",
+      "donnees de comptage",
+      "données de comptage",
+      "afc-agence prod",
+      "afc gestion petitprod",
+      "edf obligation d achat",
+      "obligation d achat",
+      "oa-solaire",
+      "oa solaire",
+      "isolarcloud",
+      "bfc solaire"
+    ])
+  ) {
+    classification.entity = "SAS";
+    classification.activity = "Solaire";
+    classification.category = "Document solaire";
+    classification.dossier = buildSasDossierPath_("01_Solaire");
+    classification.status = "À extraire";
+    classification.confiance = "Forte";
+    classification.rule = "SOLAIRE_GLOBAL";
+    classification.action = "";
+    classification.createAction = false;
 
-  // Factures fournisseurs (exemple IMC Chaudronnerie)
-  if (lowSub.indexOf('facture') !== -1 || lowSub.indexOf('invoice') !== -1) {
-    // Si expéditeur contient un nom de fournisseur connu
-    var fournisseurs = ['imc', 'fournisseur', 'sas bigueure brothers', 'earl des acacias'];
-    for (var k = 0; k < fournisseurs.length; k++) {
-      if (lowFrom.indexOf(fournisseurs[k]) !== -1) {
-        classification.entity = 'SAS';
-        classification.activity = 'Fournisseurs';
-        classification.category = 'Facture';
-        classification.dossier = buildSasDossierPath_('05_Factures_Fournisseurs');
-        classification.rule = 'FACTURE_FOURNISSEUR';
-        classification.confiance = 'Moyenne';
-        return classification;
-      }
+    if (containsAny_(all, ["facture", "votre facture", "facture enedis"])) {
+      classification.category = "Facture";
+      classification.dossier = buildSasDossierPath_("01_Solaire/Enedis_Factures");
+      classification.rule = "ENEDIS_FACTURE";
     }
-  }
 
-  // Comptables Cerfrance (Valentine Bardoux, Sylvain Ligey) : mails à traiter ou à vérifier
-  if (lowFrom.indexOf('alliancecomtoise.cerfrance.fr') !== -1 || lowFrom.indexOf('vbardoux') !== -1 || lowFrom.indexOf('sligey') !== -1) {
-    classification.entity = 'SAS';
-    classification.activity = 'Comptable';
-    classification.category = 'Échanges comptables';
-    classification.dossier = buildSasDossierPath_('06_Bilan_Comptable');
-    classification.rule = 'CERFRANCE_COMPTABLE';
-    classification.status = 'À vérifier';
-    classification.action = 'Vérifier l’objet et classer correctement les pièces jointes (échanges comptables)';
-    classification.confiance = 'Moyenne';
+    if (
+      containsAny_(all, [
+        "publication semestrielle",
+        "donnees de comptage",
+        "données de comptage",
+        "comptage"
+      ])
+    ) {
+      classification.category = "Données de comptage";
+      classification.dossier = buildSasDossierPath_("01_Solaire/Enedis_Comptage");
+      classification.rule = "ENEDIS_COMPTAGE";
+    }
+
+    if (containsAny_(all, ["paiement de votre facture", "obligation d achat", "oa-solaire"])) {
+      classification.category = "OA / Paiement";
+      classification.dossier = buildSasDossierPath_("01_Solaire/EDF_OA");
+      classification.rule = "OA_SOLAIRE";
+    }
+
+    if (containsAny_(all, ["isolarcloud"])) {
+      classification.category = "iSolarCloud";
+      classification.dossier = buildSasDossierPath_("01_Solaire/iSolarCloud");
+      classification.rule = "ISOLARCLOUD";
+    }
+
     return classification;
   }
 
-  // Emails personnels divers (Licitor, RH, DRH, congés, notifications RH, etc.)
-  var persoPatterns = ['licitor', 'congé payé', 'rh', 'nomination'];
-  for (var m = 0; m < persoPatterns.length; m++) {
-    if (lowSub.indexOf(persoPatterns[m]) !== -1 || lowFrom.indexOf(persoPatterns[m]) !== -1) {
-      classification.entity = 'Perso_Vie';
-      classification.activity = 'Administratif';
-      classification.category = 'Notification';
-      classification.dossier = buildPersoVieDossierPath_('99_A_Verifier');
-      classification.rule = 'PERSO_NOTIF';
-      classification.status = 'À vérifier';
-      classification.action = 'Vérifier si ce document concerne la vie personnelle';
-      classification.confiance = 'Faible';
-      return classification;
-    }
+  /*
+ * 4. Airbnb / locations personnelles.
+ */
+if (
+  containsAny_(all, [
+    "airbnb",
+    "versement",
+    "reservation airbnb",
+    "réservation airbnb",
+    "logement",
+    "identifiant de versement",
+    "revenus"
+  ])
+) {
+  classification.entity = "Perso_Locations";
+  classification.activity = "Airbnb";
+  classification.category = "Réservation / Versement";
+  classification.status = "À vérifier";
+  classification.confiance = "Moyenne";
+  classification.rule = "AIRBNB_GLOBAL";
+  classification.typeAction = "Vérifier classement";
+  classification.action = "Confirmer si le mail Airbnb concerne Aubervilliers ou Annoire.";
+  classification.createAction = true;
+
+  /*
+   * Règle spécifique :
+   * Pépé grange rénovée = Airbnb Annoire.
+   */
+  if (
+    containsAny_(all, [
+      "pepe grange renovee",
+      "pépé grange rénovée",
+      "grange renovee",
+      "grange rénovée",
+      "annoire"
+    ])
+  ) {
+    classification.activity = "Airbnb_Annoire";
+    classification.dossier = buildPersoLocationDossierPath_("02_Airbnb_Annoire/Airbnb_Réservations");
+    classification.status = "Détecté";
+    classification.confiance = "Forte";
+    classification.rule = "AIRBNB_ANNOIRE";
+    classification.action = "";
+    classification.createAction = false;
+    return classification;
   }
 
-  // Par défaut, laisser en À vérifier
-  classification.entity = '';
-  classification.activity = '';
-  classification.category = '';
-  classification.dossier = '';
-  classification.status = 'À vérifier';
-  classification.confiance = 'Faible';
-  classification.rule = 'DEFAULT';
-  classification.action = 'Examiner cet e-mail manuellement pour déterminer son classement.';
+  /*
+   * Règle spécifique :
+   * Aubervilliers si l'adresse ou la ville apparaît.
+   */
+  if (
+    containsAny_(all, [
+      "aubervilliers",
+      "52 rue auvry",
+      "rue auvry",
+      "93300"
+    ])
+  ) {
+    classification.activity = "Airbnb_Aubervilliers";
+    classification.dossier = buildPersoLocationDossierPath_("01_Airbnb_Aubervilliers/Airbnb_Réservations");
+    classification.status = "Détecté";
+    classification.confiance = "Forte";
+    classification.rule = "AIRBNB_AUBERVILLIERS";
+    classification.action = "";
+    classification.createAction = false;
+    return classification;
+  }
+
+  /*
+   * Si le logement n'est pas identifié, on garde une action de vérification.
+   */
+  classification.dossier = buildPersoLocationDossierPath_("99_A_Verifier");
+  return classification;
+}
+
+  /*
+   * 5. Wecasa = frais de ménage Airbnb Aubervilliers.
+   */
+  if (containsAny_(all, ["wecasa", "session menage", "session ménage", "aide menagere", "aide ménagère"])) {
+    classification.entity = "Perso_Locations";
+    classification.activity = "Airbnb_Aubervilliers";
+    classification.category = "Frais ménage";
+    classification.dossier = buildPersoLocationDossierPath_("01_Airbnb_Aubervilliers/Frais_Ménage_Wecasa");
+    classification.status = "À extraire";
+    classification.confiance = "Forte";
+    classification.rule = "WECASA_AUBERVILLIERS";
+    classification.action = "";
+    classification.createAction = false;
+    return classification;
+  }
+
+  /*
+   * 6. Banque / assurance.
+   * On garde en À vérifier car il faut distinguer perso / SAS.
+   */
+  if (
+    containsAny_(all, [
+      "credit agricole",
+      "crédit agricole",
+      "ca-franchecomte",
+      "banque postale",
+      "labanquepostale",
+      "revolut",
+      "virement",
+      "prelevement",
+      "prélèvement",
+      "vos documents banque assurance",
+      "message de notification",
+      "releve bancaire",
+      "relevé bancaire"
+    ])
+  ) {
+    classification.entity = "À vérifier";
+    classification.activity = "Banque";
+    classification.category = "Notification bancaire";
+    classification.dossier = "99_A_VERIFIER_GLOBAL";
+    classification.status = "À vérifier";
+    classification.confiance = "Moyenne";
+    classification.rule = "BANQUE_A_VERIFIER";
+    classification.typeAction = "Vérifier classement";
+    classification.action = "Vérifier si ce mail bancaire concerne la SAS, le perso ou les locations.";
+    classification.createAction = true;
+    return classification;
+  }
+
+  /*
+   * 7. Santé / pharmacie / administratif perso.
+   */
+  if (
+    containsAny_(all, [
+      "pharmacie",
+      "pharmaciedusports",
+      "centre racine",
+      "espace patient",
+      "msa",
+      "remboursements maladie",
+      "mutuelle",
+      "securite sociale",
+      "sécurité sociale"
+    ])
+  ) {
+    classification.entity = "Perso_Vie";
+    classification.activity = "Santé";
+    classification.category = "Santé / remboursement / justificatif";
+    classification.dossier = buildPersoVieDossierPath_("03_Sante");
+    classification.status = "À vérifier";
+    classification.confiance = "Moyenne";
+    classification.rule = "SANTE_PERSO";
+    classification.typeAction = "Vérifier classement";
+    classification.action = "Vérifier si ce mail santé doit être conservé comme justificatif personnel.";
+    classification.createAction = true;
+    return classification;
+  }
+
+  /*
+   * 8. Factures / commandes / fournisseurs.
+   * Prudence : Amazon, Leroy, Prolians peuvent être perso ou pro.
+   */
+  if (
+    containsAny_(all, [
+      "facture",
+      "commande",
+      "expedie",
+      "expédié",
+      "livre",
+      "livré",
+      "paiement",
+      "recu",
+      "reçu",
+      "justificatif",
+      "amazon",
+      "prolians",
+      "boulanger",
+      "leroy merlin",
+      "totalenergies",
+      "edf",
+      "sncf",
+      "transavia",
+      "eurostar"
+    ])
+  ) {
+    classification.entity = "À vérifier";
+    classification.activity = "Achat / justificatif";
+    classification.category = "Facture ou justificatif potentiel";
+    classification.dossier = "99_A_VERIFIER_GLOBAL";
+    classification.status = "À vérifier";
+    classification.confiance = "Faible";
+    classification.rule = "FACTURE_JUSTIFICATIF_A_VERIFIER";
+    classification.typeAction = "Vérifier classement";
+    classification.action = "Vérifier si ce mail contient un justificatif utile pour SAS, perso ou locations.";
+    classification.createAction = true;
+    return classification;
+  }
+
+  /*
+   * 9. COMET / Groupama hors compta perso.
+   * À exclure du flux compta/admin perso.
+   */
+  if (
+    containsAny_(all, [
+      "comet",
+      "upmeet",
+      "gma",
+      "groupama",
+      "habilitations comet",
+      "habilitation comet",
+      "synchro gma",
+      "go/no go",
+      "documentation dpom",
+      "demande d acces",
+      "demande d'accès",
+      "cooperactions",
+      "sharepoint"
+    ])
+  ) {
+    classification.status = "Exclu";
+    classification.confiance = "Forte";
+    classification.rule = "EXCLUSION_COMET_GROUPAMA";
+    classification.action = "";
+    classification.createAction = false;
+    return classification;
+  }
+
+  /*
+   * 10. Cas par défaut.
+   * Si aucune règle utile ne s'applique : on exclut, pour ne pas transformer toute la boîte mail en actions.
+   */
+  classification.status = "Exclu";
+  classification.confiance = "Moyenne";
+  classification.rule = "DEFAULT_NON_UTILE";
+  classification.action = "";
+  classification.createAction = false;
+
   return classification;
 }
 
@@ -767,4 +1026,459 @@ function getExtension_(name) {
  */
 function quoteGmailLabel_(label) {
   return '"' + label + '"';
+}
+function isClearlyExcluded_(lowFrom, lowRecipients, lowSubject, lowBody, lowAttachments) {
+  var all = [
+    lowFrom,
+    lowRecipients,
+    lowSubject,
+    lowBody,
+    lowAttachments
+  ].join(" ");
+
+  /*
+   * Ne jamais exclure si un signal comptable / administratif fort est présent.
+   * Cette exception protège les vrais justificatifs.
+   */
+  var strongAccountingSignals = [
+    "cerfrance",
+    "alliancecomtoise",
+    "valentine bardoux",
+    "sylvain ligey",
+    "vbardoux",
+    "sligey",
+    "enedis",
+    "oa-solaire",
+    "obligation d achat",
+    "isolarcloud",
+    "airbnb",
+    "wecasa",
+    "tva",
+    "facture",
+    "releve bancaire",
+    "relevé bancaire",
+    "sas bigueure brothers",
+    "credit agricole",
+    "crédit agricole",
+    "banque postale",
+    "labanquepostale",
+    "revolut"
+  ];
+
+  /*
+   * Exception Amazon :
+   * - On exclut les mails marketing Amazon.
+   * - On conserve les mails de commande / livraison / facture.
+   */
+  if (
+    containsAny_(all, [
+      "amazon.fr",
+      "annonce@amazon.fr",
+      "nous avons trouve quelque chose qui pourrait vous plaire",
+      "nous avons trouvé quelque chose qui pourrait vous plaire",
+      "offres sur les grandes marques",
+      "semaine tech",
+      "continuez vos achats"
+    ]) &&
+    !containsAny_(all, [
+      "confirmation-commande",
+      "expedie",
+      "expédié",
+      "livre",
+      "livré",
+      "facture",
+      "recu",
+      "reçu",
+      "votre commande",
+      "commande n"
+    ])
+  ) {
+    return true;
+  }
+
+  /*
+   * Exception Boulanger :
+   * - Exclure les emails marketing.
+   * - Conserver si facture / commande / achat.
+   */
+  if (
+    containsAny_(all, [
+      "boulanger@email.boulanger.com",
+      "club+",
+      "cagnotte",
+      "30€ cagnotes",
+      "30€ cagnottes",
+      "30€ cagnottés"
+    ]) &&
+    !containsAny_(all, [
+      "facture",
+      "commande",
+      "achat",
+      "livraison",
+      "retrait",
+      "recu",
+      "reçu"
+    ])
+  ) {
+    return true;
+  }
+
+  /*
+   * Exception Colissimo :
+   * - En général, ce n'est pas une pièce comptable.
+   * - On exclut sauf si le mail contient clairement une facture ou un justificatif.
+   */
+  if (
+    containsAny_(all, [
+      "noreply@notif-colissimo-laposte.info",
+      "votre colis a bien ete livre",
+      "votre colis a bien été livré",
+      "votre colis arrive",
+      "votre colis est arrive",
+      "votre colis est arrivé"
+    ]) &&
+    !containsAny_(all, [
+      "facture",
+      "justificatif",
+      "recu",
+      "reçu"
+    ])
+  ) {
+    return true;
+  }
+
+  /*
+   * Exclusions fortes : newsletters, promotions, réseaux sociaux,
+   * alertes commerciales, notifications techniques non comptables.
+   */
+  var excludedPatterns = [
+    "adidas",
+    "arlettie",
+    "campoluz",
+    "belambra",
+    "tinder",
+    "instagram",
+    "pinterest",
+    "marionnaud",
+    "balibaris",
+    "picard",
+    "decantalo",
+    "silvera",
+    "fursac",
+    "octobre",
+    "le tanneur",
+    "samsung",
+    "asus",
+    "bang & olufsen",
+    "the cool republic",
+    "merci paris",
+    "altermundi",
+    "decoclico",
+    "koanna",
+    "festival scope",
+    "philharmonie",
+    "theatreonline",
+    "ticketac",
+    "la vallee village",
+    "newsletter",
+    "news@",
+    "emailing",
+    "promo",
+    "promotion",
+    "vente est ouverte",
+    "derniere chance",
+    "dernière chance",
+    "offres exclusives",
+    "bons plans",
+    "selection de la semaine",
+    "sélection de la semaine",
+    "selections du week-end",
+    "les incontournables",
+    "nouvelle collection",
+    "rejoignez",
+    "annonces@alertes.seloger.com",
+    "seloger",
+    "bien'ici",
+    "bien ici",
+    "indeed",
+    "experteer",
+    "jobalert",
+    "jobs",
+    "recrute",
+    "responsable developpement entreprises",
+    "nomination",
+    "fdj",
+    "licitor",
+    "parti-renaissance",
+    "ville de paris",
+    "openai",
+    "chatgpt",
+    "task update",
+    "google developer profile",
+    "welcome to your google developer profile",
+    "alerte de securite google",
+    "alerte de sécurité",
+    "no-reply@accounts.google.com",
+    "noreply-apps-scripts-notifications",
+    "summary of failures for google apps script",
+    "code de confirmation",
+    "code de securite",
+    "code de sécurité",
+    "universign",
+    "microsoft teams",
+    "reunion microsoft teams",
+    "réunion microsoft teams",
+    "invite.ics",
+    "creation de l evenement.ics",
+    "création de l'évènement.ics",
+    "suppression de l evenement.ics",
+    "conge paye",
+    "congé payé",
+    "accepté :",
+    "acceptée :",
+    "refusé :",
+    "refusée :",
+    "annulé:",
+    "annule:",
+    "annulation d affichage",
+    "upmeet",
+    "votre compte-rendu upmeet",
+    "retranscription.pdf",
+    "bienvenue dans votre espace client",
+    "40€ offerts pour votre premiere commande",
+    "40€ offerts pour votre première commande"
+  ];
+
+  if (containsAny_(all, excludedPatterns)) {
+    /*
+     * Si un signal comptable fort est présent, ne pas exclure.
+     */
+    if (containsAny_(all, strongAccountingSignals)) {
+      return false;
+    }
+
+    return true;
+  }
+
+  return false;
+}
+function buildDocumentRow_(data) {
+  var message = data.message;
+  var now = data.now;
+  var dateMail = data.dateMail;
+  var direction = data.direction;
+  var from = data.from;
+  var recipients = data.recipients;
+  var subject = data.subject;
+  var bodyPreview = data.bodyPreview;
+  var attachmentSummary = data.attachmentSummary;
+  var classification = data.classification;
+  var driveLinks = data.driveLinks || "";
+
+  var gmailLink = "https://mail.google.com/mail/u/0/#all/" + message.getId();
+
+  var documentId = message.getId();
+
+  return [
+    documentId,                                                        // Document_ID
+    Utilities.formatDate(now, Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm:ss"), // Date_detection
+    Utilities.formatDate(dateMail, Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm:ss"), // Date_mail
+    direction,                                                         // Sens_mail
+    from,                                                              // Expéditeur
+    recipients,                                                        // Destinataires
+    subject,                                                           // Objet
+    bodyPreview,                                                       // Extrait_mail
+    attachmentSummary.names,                                           // Nom_piece_jointe
+    attachmentSummary.types,                                           // Type_piece_jointe
+    attachmentSummary.sizes,                                           // Taille_piece_jointe
+    classification.entity,                                             // Entité
+    classification.activity,                                           // Activité
+    classification.category,                                           // Catégorie
+    classification.dossier,                                            // Dossier_cible
+    classification.dossierExistantProbable || "",                      // Dossier_existant_probable
+    classification.status,                                             // Statut_document
+    classification.confiance,                                          // Confiance
+    classification.rule,                                               // Règle_appliquée
+    classification.decisionIA || "",                                   // Décision_IA
+    classification.action || "",                                       // Action_recommandée
+    gmailLink,                                                         // Lien_Gmail
+    driveLinks,                                                        // Lien_Drive
+    classification.dejaTransmisComptable || "Non",                     // Déjà_transmis_comptable
+    classification.doublonProbable || "Non",                           // Doublon_probable
+    classification.comment || "",                                      // Commentaire
+    Utilities.formatDate(now, Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm:ss") // Dernière_maj
+  ];
+}
+function buildActionRow_(data) {
+  var message = data.message;
+  var now = data.now;
+  var documentId = data.documentId;
+  var classification = data.classification;
+  var driveLinks = data.driveLinks || "";
+
+  var gmailLink = "https://mail.google.com/mail/u/0/#all/" + message.getId();
+
+  var actionId = Utilities.getUuid();
+
+  return [
+    actionId,                                                          // Action_ID
+    Utilities.formatDate(now, Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm:ss"), // Date_creation
+    "Gmail",                                                           // Source
+    documentId,                                                        // Document_ID
+    classification.entity || "À vérifier",                             // Domaine
+    classification.activity || "",                                     // Activité
+    classification.typeAction || "Vérifier classement",                // Type_action
+    classification.action || "Vérifier le classement du mail.",        // Action
+    classification.priority || "Moyenne",                              // Priorité
+    "",                                                               // Échéance
+    "Aurélien",                                                        // Responsable
+    "Ouvert",                                                          // Statut_action
+    gmailLink,                                                         // Lien_Gmail
+    driveLinks,                                                        // Lien_Drive
+    "Non",                                                            // Créer_Task
+    "",                                                               // Task_ID
+    "Non",                                                            // Créer_Calendar
+    "",                                                               // Calendar_Event_ID
+    classification.comment || "",                                      // Commentaire
+    Utilities.formatDate(now, Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm:ss") // Dernière_maj
+  ];
+}
+function getRelevantAttachments_(attachments) {
+  var relevant = [];
+
+  if (!attachments || attachments.length === 0) {
+    return relevant;
+  }
+
+  var allowedExtensions = [
+    "pdf",
+    "doc",
+    "docx",
+    "xls",
+    "xlsx",
+    "csv",
+    "jpg",
+    "jpeg",
+    "png"
+  ];
+
+  var excludedExtensions = [
+    "ics"
+  ];
+
+  attachments.forEach(function(att) {
+    var name = att.getName() || "";
+    var ext = getExtension_(name);
+
+    if (excludedExtensions.indexOf(ext) !== -1) {
+      return;
+    }
+
+    if (allowedExtensions.indexOf(ext) === -1) {
+      return;
+    }
+
+    /*
+     * Exclure les petites images automatiques de signature / tracking.
+     */
+    if (
+      ["jpg", "jpeg", "png"].indexOf(ext) !== -1 &&
+      att.getSize() < 15000
+    ) {
+      return;
+    }
+
+    relevant.push(att);
+  });
+
+  return relevant;
+}
+function getAttachmentSummary_(attachments) {
+  if (!attachments || attachments.length === 0) {
+    return {
+      names: "",
+      types: "",
+      sizes: ""
+    };
+  }
+
+  var names = [];
+  var types = [];
+  var sizes = [];
+
+  attachments.forEach(function(att) {
+    names.push(att.getName() || "");
+    types.push(att.getContentType() || "");
+    sizes.push(String(att.getSize() || ""));
+  });
+
+  return {
+    names: names.join("\n"),
+    types: types.join("\n"),
+    sizes: sizes.join("\n")
+  };
+}
+function detectMailDirection_(from, recipients) {
+  var lowFrom = normalizeText_(from);
+  var lowRecipients = normalizeText_(recipients);
+
+  var myEmails = [
+    "aurelienbigueure@gmail.com",
+    "aurelien.bigueure@groupama.com",
+    "aurelien.bigueure",
+    "aurelien bigueure"
+  ];
+
+  if (containsAny_(lowFrom, myEmails)) {
+    return "Envoyé";
+  }
+
+  if (containsAny_(lowRecipients, myEmails)) {
+    return "Reçu";
+  }
+
+  return "Reçu";
+}
+function isSentToComptable_(lowRecipients) {
+  return containsAny_(lowRecipients, [
+    "cerfrance",
+    "alliancecomtoise",
+    "vbardoux",
+    "valentine bardoux",
+    "sligey",
+    "sylvain ligey"
+  ]);
+}
+function containsAny_(text, patterns) {
+  if (!text) {
+    return false;
+  }
+
+  var normalizedText = normalizeText_(text);
+
+  for (var i = 0; i < patterns.length; i++) {
+    var pattern = normalizeText_(patterns[i]);
+
+    if (pattern && normalizedText.indexOf(pattern) !== -1) {
+      return true;
+    }
+  }
+
+  return false;
+}
+function normalizeText_(value) {
+  if (!value) {
+    return "";
+  }
+
+  return String(value)
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&#40;/g, "(")
+    .replace(/&#41;/g, ")")
+    .replace(/&amp;/g, "&")
+    .replace(/\s+/g, " ")
+    .trim();
 }
