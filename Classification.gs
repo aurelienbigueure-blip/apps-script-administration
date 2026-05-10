@@ -6,6 +6,21 @@ function isClearlyExcluded_(from, to, subject, bodyPreview) {
   var lowBody = (bodyPreview || '').toLowerCase();
   var haystack = [lowFrom, lowTo, lowSub, lowBody].join(' ');
 
+  // Priorité aux alertes Indeed pour éviter les faux positifs "Banque".
+  var indeedAlertPriorityPatterns = [
+    'donotreply@jobalert.indeed.com',
+    'alerte emploi indeed',
+    'nouveaux emplois',
+    'offres de "',
+    'recherche un/e',
+    'indeed.com'
+  ];
+  for (var ip = 0; ip < indeedAlertPriorityPatterns.length; ip++) {
+    if (haystack.indexOf(indeedAlertPriorityPatterns[ip]) !== -1) {
+      return { excluded: true, rule: 'EXCL_INDEED_JOB_ALERT' };
+    }
+  }
+
   var neverExcludePatterns = [
     'cerfrance',
     'alliancecomtoise.cerfrance.fr',
@@ -40,7 +55,7 @@ function isClearlyExcluded_(from, to, subject, bodyPreview) {
   var exclusionRules = [
     { rule: 'EXCL_NEWSLETTER', patterns: ['newsletter', 'unsubscribe', 'se désabonner', 'se desabonner', 'désinscription', 'desinscription'] },
     { rule: 'EXCL_PUBLICITE', patterns: ['publicité', 'publicite', 'promo', 'promotion', 'offre spéciale', 'offre speciale', 'soldes', 'black friday'] },
-    { rule: 'EXCL_INDEED_JOB_ALERT', patterns: ['indeed', 'job alert', 'alerte emploi', 'nouveaux emplois', 'votre alerte emploi'] },
+    { rule: 'EXCL_INDEED_JOB_ALERT', patterns: ['indeed', 'job alert', 'alerte emploi', 'alerte emploi indeed', 'nouveaux emplois', 'votre alerte emploi', 'donotreply@jobalert.indeed.com', 'offres de "', 'recherche un/e', 'indeed.com'] },
     { rule: 'EXCL_GOOGLE_NOTIFICATION', patterns: ['google alerts', 'google account', 'security alert', 'alerte de sécurité', 'alerte de securite', 'google no-reply', 'no-reply@google.com', 'accounts.google.com'] },
     { rule: 'EXCL_CALENDAR_INVITE', patterns: ['invite.ics', 'invitation calendrier', 'calendar invite', 'google calendar', 'microsoft teams', 'teams meeting', 'join the meeting', 'réunion teams', 'reunion teams'] }
   ];
