@@ -5,49 +5,30 @@ function isClearlyExcluded_(from, to, subject, bodyPreview) {
   var lowSub = (subject || '').toLowerCase();
   var lowBody = (bodyPreview || '').toLowerCase();
   var haystack = [lowFrom, lowTo, lowSub, lowBody].join(' ');
-
-  // Priorité aux alertes Indeed pour éviter les faux positifs "Banque".
-  var indeedAlertPriorityPatterns = [
-    'donotreply@jobalert.indeed.com',
-    'alerte emploi indeed',
-    'nouveaux emplois',
-    'offres de "',
-    'recherche un/e',
-    'indeed.com'
-  ];
-  for (var ip = 0; ip < indeedAlertPriorityPatterns.length; ip++) {
-    if (haystack.indexOf(indeedAlertPriorityPatterns[ip]) !== -1) {
-      return { excluded: true, rule: 'EXCL_INDEED_JOB_ALERT' };
-    }
-  }
-
-  var neverExcludePatterns = [
+  var strongAccountingSignals = [
     'cerfrance',
     'alliancecomtoise.cerfrance.fr',
     'enedis',
     'wecasa',
     'airbnb',
-    'banque',
-    'credit agricole',
-    'crédit agricole',
-    'societe generale',
-    'société générale',
-    'bnp',
-    'lcl',
-    'caisse d\'epargne',
-    'caisse d\'épargne',
     'tva',
     'urssaf',
+    'relevé bancaire',
+    'releve bancaire',
     'impôt',
     'impot',
     'facture',
     'invoice',
     'justificatif',
     'reçu',
-    'recu'
+    'recu',
+    'sas bigueure brothers',
+    'crédit agricole vrai document bancaire',
+    'credit agricole vrai document bancaire',
+    'banque postale vrai document bancaire'
   ];
-  for (var i = 0; i < neverExcludePatterns.length; i++) {
-    if (haystack.indexOf(neverExcludePatterns[i]) !== -1) {
+  for (var s = 0; s < strongAccountingSignals.length; s++) {
+    if (haystack.indexOf(strongAccountingSignals[s]) !== -1) {
       return { excluded: false, rule: '' };
     }
   }
@@ -56,6 +37,7 @@ function isClearlyExcluded_(from, to, subject, bodyPreview) {
     { rule: 'EXCL_NEWSLETTER', patterns: ['newsletter', 'unsubscribe', 'se désabonner', 'se desabonner', 'désinscription', 'desinscription'] },
     { rule: 'EXCL_PUBLICITE', patterns: ['publicité', 'publicite', 'promo', 'promotion', 'offre spéciale', 'offre speciale', 'soldes', 'black friday'] },
     { rule: 'EXCL_INDEED_JOB_ALERT', patterns: ['indeed', 'job alert', 'alerte emploi', 'alerte emploi indeed', 'nouveaux emplois', 'votre alerte emploi', 'donotreply@jobalert.indeed.com', 'offres de "', 'recherche un/e', 'indeed.com'] },
+    { rule: 'EXCL_MARKETING_BRANDS', patterns: ['github', 'noreply@github.com', 'mermaid.ai', 'hello@mermaid.ai', 'arlettie', 'annonce@amazon.fr', 'instagram', 'decantalo', 'patchplants', 'leboncoin newsletters', 'thecoolrepublic', 'fnac photo', 'printemps', 'filovent', 'lovable.dev', 'baobabcollection', 'chatgpt task update', 'bonsoirs', 'eurostar promo'] },
     { rule: 'EXCL_GOOGLE_NOTIFICATION', patterns: ['google alerts', 'google account', 'security alert', 'alerte de sécurité', 'alerte de securite', 'google no-reply', 'no-reply@google.com', 'accounts.google.com'] },
     { rule: 'EXCL_CALENDAR_INVITE', patterns: ['invite.ics', 'invitation calendrier', 'calendar invite', 'google calendar', 'microsoft teams', 'teams meeting', 'join the meeting', 'réunion teams', 'reunion teams'] }
   ];
@@ -74,10 +56,6 @@ function isClearlyExcluded_(from, to, subject, bodyPreview) {
 
 // Classe un email selon des règles métier simples.
 function classifyEmail_(from, to, subject, bodyPreview) {
-  var lowFrom = from.toLowerCase();
-  var lowSub = subject.toLowerCase();
-  var lowBody = bodyPreview.toLowerCase();
-
   var classification = {
     entity: '',
     activity: '',
@@ -86,15 +64,23 @@ function classifyEmail_(from, to, subject, bodyPreview) {
     status: 'À extraire',
     confiance: 'Moyenne',
     rule: '',
-    action: ''
+    action: '',
+    createAction: true
   };
 
   var exclusionResult = isClearlyExcluded_(from, to, subject, bodyPreview);
   if (exclusionResult && exclusionResult.excluded) {
     classification.status = 'Exclu';
+    classification.confiance = 'Forte';
     classification.rule = exclusionResult.rule || 'EXCLUSION_RULE';
+    classification.action = '';
+    classification.createAction = false;
     return classification;
   }
+
+  var lowFrom = from.toLowerCase();
+  var lowSub = subject.toLowerCase();
+  var lowBody = bodyPreview.toLowerCase();
 
   if (lowFrom.indexOf('enedis-noreply') !== -1 && lowSub.indexOf('facture') !== -1) {
     classification.entity = 'SAS';
