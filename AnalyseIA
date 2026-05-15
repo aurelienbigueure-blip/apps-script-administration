@@ -1,0 +1,725 @@
+/**
+ * Analyse IA de production pour 02_Actions.
+ * Cette fonction lit uniquement A1:Z300, ne touche jamais aux statuts,
+ * et n'appelle ni Gmail ni Drive.
+ */
+
+var COMPTA_ADMIN_OPENAI_MODEL = 'gpt-4o-mini';
+var COMPTA_ADMIN_IA_MAX_ACTIONS = 5;
+var COMPTA_ADMIN_IA_MAX_SECONDS = 90;
+var COMPTA_ADMIN_ALLOWED_DECISIONS = [
+  'A_IGNORER',
+  'A_TRAITER',
+  'A_VERIFIER',
+  'EN_ATTENTE'
+];
+
+/**
+ * Analyse au maximum 5 actions ouvertes non encore analysées par IA.
+ * Écrit obligatoirement :
+ * W = Décision_IA_proposée
+ * X = Commentaire_IA
+ * Y = Règle_correction_proposée
+ * Z = Analyse_IA
+ */
+function analyserActionsOuvertesRapideIA() {
+  Logger.log('VERSION PROD WXYZ - 2026-05-10');
+  Logger.log('Début analyse IA rapide');
+
+  var start = Date.now();
+  var maxRuntimeMs = COMPTA_ADMIN_IA_MAX_SECONDS * 1000;
+  var maxRowsPerRun = COMPTA_ADMIN_IA_MAX_ACTIONS;
+
+  var ss = getSpreadsheetForComptaAdminIA_();
+  var sheet = ss.getSheetByName('02_Actions');
+
+  if (!sheet) {
+    throw new Error('Onglet 02_Actions introuvable.');
+  }
+
+  // Garantir les en-têtes IA en W:Z.
+  sheet.getRange(1, 23, 1, 4).setValues([[
+    'Décision_IA_proposée',
+    'Commentaire_IA',
+    'Règle_correction_proposée',
+    'Analyse_IA'
+  ]]);
+
+  var lastRow = Math.min(sheet.getLastRow(), 300);
+
+  if (lastRow < 2) {
+    Logger.log('Aucune ligne à analyser.');
+    return;
+  }
+
+  var values = sheet.getRange(1, 1, lastRow, 26).getValues();
+  var headers = values[0];
+  var headerMap = buildHeaderMap_(headers);
+
+  var required = [
+    'Domaine',
+    'Action',
+    'Priorité',
+    'Statut_action',
+    'Lien_Gmail',
+    'Commentaire',
+    'Dernière_maj'
+  ];
+
+  required.forEach(function(name) {
+    if (headerMap[name] === undefined) {
+      throw new Error('Colonne manquante dans 02_Actions : ' + name);
+    }
+  });
+
+  var apiKey = getOpenAIKeyForComptaAdmin_();
+
+  if (!apiKey) {
+    throw new Error('OPENAI_API_KEY absente dans les propriétés du script.');
+  }
+
+  var opened = 0;
+  var alreadyAnalysed = 0;
+  var processed = 0;
+
+  for (var r = 1; r < values.length; r++) {
+    if (Date.now() - start > maxRuntimeMs) {
+      Logger.log('Arrêt préventif avant timeout.');
+      break;
+    }
+
+    if (processed >= maxRowsPerRun) {
+      break;
+    }
+
+    var row = values[r];
+    var rowNumber = r + 1;
+
+    var statut = String(row[headerMap['Statut_action']] || '').trim();
+
+    if (statut !== 'Ouvert') {
+      continue;
+    }
+
+    opened++;
+
+    // W = index 22 en tableau JS.
+    // Important : on ignore uniquement si W est rempli.
+    // Si Z est rempli mais W vide, on réanalyse pour compléter W:X:Y:Z.
+    var decisionIA = String(row[22] || '').trim();
+
+    if (decisionIA) {
+      alreadyAnalysed++;
+      continue;
+    }
+
+    Logger.log('Analyse IA ligne = ' + rowNumber);
+
+    var lienGmail = row[headerMap['Lien_Gmail']] || '';
+
+var payload = {
+  domaine: row[headerMap['Domaine']] || '',
+  action: row[headerMap['Action']] || '',
+  priorite: row[headerMap['Priorité']] || '',
+  statut_action: row[headerMap['Statut_action']] || '',
+  lien_gmail: lienGmail,
+  commentaire_utilisateur: row[headerMap['Commentaire']] || '',
+  derniere_maj: row[headerMap['Dernière_maj']] || ''
+};
+
+var gmailInfo = enrichirPayloadAvecGmail_(payload, lienGmail);
+
+payload.sujet_gmail = gmailInfo.sujet_gmail;
+payload.expediteur_gmail = gmailInfo.expediteur_gmail;
+payload.destinataire_gmail = gmailInfo.destinataire_gmail;
+payload.extrait_gmail = gmailInfo.extrait_gmail;
+payload.has_attachments = gmailInfo.has_attachments;
+payload.noms_pieces_jointes = gmailInfo.noms_pieces_jointes;
+
+    var result = analyseActionRowWithOpenAI_(payload, apiKey);
+result = postTraiterResultatIAPourActions_(result, payload);
+
+if (!result.ok) {
+      sheet.getRange(rowNumber, 23, 1, 4).setValues([[
+        'A_VERIFIER',
+        'Erreur OpenAI HTTP ' + result.httpStatus,
+        '',
+        truncateForSheet_(result.error || 'Erreur pendant analyse IA', 1000)
+      ]]);
+// O = Créer_Task
+// P = Task_ID
+// Q = Créer_Calendar
+// R = Calendar_Event_ID
+// S = Commentaire
+
+if (result.creation_task) {
+  sheet.getRange(rowNumber, 15).setValue('Oui'); // O
+}
+
+if (result.creation_calendar) {
+  sheet.getRange(rowNumber, 17).setValue('Oui'); // Q
+}
+
+// Ne jamais écrire dans P ou R ici.
+// P et R sont réservés aux IDs réels de Google Tasks / Calendar.
+
+var existingComment = String(sheet.getRange(rowNumber, 19).getValue() || '').trim();
+var extraParts = [];
+
+if (result.famille) {
+  extraParts.push('Famille IA : ' + result.famille);
+}
+
+if (result.task_title) {
+  extraParts.push('Task IA : ' + result.task_title);
+}
+
+if (result.creation_calendar) {
+  extraParts.push(
+    'Calendar IA : ' +
+    [
+      result.calendar_title,
+      result.calendar_start_text,
+      result.calendar_end_text,
+      result.calendar_location
+    ].filter(function(v) {
+      return String(v || '').trim();
+    }).join(' | ')
+  );
+}
+
+if (extraParts.length > 0) {
+  var newComment = existingComment
+    ? existingComment + ' | ' + extraParts.join(' | ')
+    : extraParts.join(' | ');
+
+  sheet.getRange(rowNumber, 19).setValue(newComment); // S
+}
+      processed++;
+      continue;
+    }
+
+    sheet.getRange(rowNumber, 23, 1, 4).setValues([[
+      result.decision,
+      result.commentaire,
+      result.regle,
+      result.analyse
+    ]]);
+
+    processed++;
+  }
+
+  Logger.log('Lignes ouvertes trouvées = ' + opened);
+  Logger.log('Lignes déjà analysées = ' + alreadyAnalysed);
+  Logger.log('Lignes analysées ce run = ' + processed);
+  Logger.log('Fin analyse IA rapide');
+}
+
+/**
+ * Appel OpenAI pour une ligne 02_Actions.
+ */
+function analyseActionRowWithOpenAI_(payload, apiKey) {
+  var prompt = buildComptaAdminIaPrompt_(payload);
+
+  var requestPayload = {
+    model: COMPTA_ADMIN_OPENAI_MODEL,
+    temperature: 0.1,
+    max_tokens: 300,
+    response_format: {
+      type: 'json_object'
+    },
+    messages: [
+      {
+        role: 'system',
+        content: 'Tu réponds uniquement en JSON valide. Tu aides à trier des actions comptables/admin.'
+      },
+      {
+        role: 'user',
+        content: prompt
+      }
+    ]
+  };
+
+  var response;
+
+  try {
+    response = UrlFetchApp.fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'post',
+      contentType: 'application/json',
+      headers: {
+        Authorization: 'Bearer ' + apiKey
+      },
+      muteHttpExceptions: true,
+      payload: JSON.stringify(requestPayload)
+    });
+  } catch (e) {
+    return {
+      ok: false,
+      httpStatus: 'EXCEPTION',
+      error: String(e)
+    };
+  }
+
+  var status = response.getResponseCode();
+  var text = response.getContentText();
+
+  Logger.log('Statut HTTP OpenAI = ' + status);
+
+  if (status < 200 || status >= 300) {
+    return {
+      ok: false,
+      httpStatus: status,
+      error: text
+    };
+  }
+
+  var parsed;
+  var content;
+  var json;
+
+  try {
+    parsed = JSON.parse(text);
+    content = parsed.choices &&
+      parsed.choices[0] &&
+      parsed.choices[0].message &&
+      parsed.choices[0].message.content;
+
+    json = JSON.parse(content || '{}');
+  } catch (e) {
+    return {
+      ok: true,
+      httpStatus: status,
+      decision: 'A_VERIFIER',
+      commentaire: 'Réponse IA illisible',
+      regle: '',
+      analyse: 'Erreur parsing JSON IA'
+    };
+  }
+
+  var decision = normalizeIaDecision_(json.decision);
+
+  return {
+  ok: true,
+  httpStatus: status,
+  famille: truncateForSheet_(json.famille || '', 100),
+  decision: decision,
+  commentaire: truncateForSheet_(json.commentaire || '', 500),
+  regle: truncateForSheet_(json.regle || '', 500),
+  analyse: truncateForSheet_(json.analyse || '', 1000),
+  creation_task: json.creation_task === true,
+  task_title: truncateForSheet_(json.task_title || '', 300),
+  creation_calendar: json.creation_calendar === true,
+  calendar_title: truncateForSheet_(json.calendar_title || '', 300),
+  calendar_start_text: truncateForSheet_(json.calendar_start_text || '', 300),
+  calendar_end_text: truncateForSheet_(json.calendar_end_text || '', 300),
+  calendar_location: truncateForSheet_(json.calendar_location || '', 300)
+};
+}
+
+/**
+ * Prompt IA stable.
+ */
+/**
+ * Prompt IA stable.
+ */
+/**
+ * Prompt IA par familles métier :
+ * - COMPTABLE
+ * - ADMINISTRATIF
+ * - PERSONNEL
+ * - AUTRE
+ */
+function buildComptaAdminIaPrompt_(payload) {
+  return [
+    'Tu es un assistant de tri administratif, comptable et personnel.',
+    '',
+    'Ton rôle est de préqualifier une ligne de 02_Actions.',
+    'Tu dois aider l’utilisateur à décider quoi faire du mail et proposer les actions utiles.',
+    '',
+    'Tu dois raisonner en 3 familles métier principales :',
+    '- COMPTABLE',
+    '- ADMINISTRATIF',
+    '- PERSONNEL',
+    '',
+    'Tu peux utiliser AUTRE seulement si aucune famille ne convient.',
+    '',
+    'Informations disponibles dans payload :',
+    '- domaine',
+    '- action',
+    '- priorite',
+    '- statut_action',
+    '- commentaire_utilisateur',
+    '- lien_gmail',
+    '- derniere_maj',
+    '- sujet_gmail si disponible',
+    '- expediteur_gmail si disponible',
+    '- destinataire_gmail si disponible',
+    '- extrait_gmail si disponible',
+    '- has_attachments si disponible',
+    '- noms_pieces_jointes si disponible',
+    '',
+    'Valeurs autorisées pour decision :',
+    '- A_IGNORER',
+    '- A_TRAITER',
+    '- A_VERIFIER',
+    '- EN_ATTENTE',
+    '',
+    'Famille COMPTABLE :',
+    'Utilise COMPTABLE pour les factures, devis, reçus, justificatifs, comptabilité, comptable, expert-comptable, Cerfrance, banque, TVA, URSSAF, MSA, paiement, montant, Booking, PULSE, Wecasa, Airbnb, location courte durée.',
+    'Décision attendue :',
+    '- A_TRAITER si document ou information comptable utile.',
+    '- EN_ATTENTE si retour comptable, paiement ou document attendu.',
+    '- A_VERIFIER si le mail semble comptable mais manque d’information.',
+    'Actions possibles :',
+    '- creation_task = true si une action humaine est nécessaire.',
+    '- creation_calendar = true seulement si échéance claire.',
+    '',
+    'Famille ADMINISTRATIF :',
+    'Utilise ADMINISTRATIF pour banque, assurance, contrat, attestation, EDF, Enedis, impôts, démarches, documents RH, administration, courrier officiel, fournisseur, service client utile.',
+    'Décision attendue :',
+    '- A_TRAITER si démarche ou document utile.',
+    '- EN_ATTENTE si réponse, validation ou retour attendu.',
+    '- A_VERIFIER si le contexte est insuffisant.',
+    'Actions possibles :',
+    '- creation_task = true si suivi ou démarche.',
+    '- creation_calendar = true si rendez-vous administratif ou date limite claire.',
+    '',
+    'Famille PERSONNEL :',
+    'Utilise PERSONNEL pour Doctolib, santé, médecin, kiné, dentiste, ophtalmo, rendez-vous médical, famille, école, livraison personnelle utile, vie courante importante.',
+    'Décision attendue :',
+    '- A_TRAITER si rendez-vous, document personnel utile ou information importante.',
+    '- EN_ATTENTE si rendez-vous futur ou suivi à faire.',
+    '- A_IGNORER si notification personnelle sans intérêt.',
+    'Actions possibles :',
+    '- creation_calendar = true si date, heure et rendez-vous détectés.',
+    '- creation_task = true si préparation ou suivi nécessaire.',
+    '',
+    'Famille AUTRE :',
+    'Utilise AUTRE pour les mails qui ne rentrent pas dans les familles précédentes.',
+    'Si publicité, newsletter, promotion, offre emploi, candidature, marketing, avis produit ou recommandation commerciale => A_IGNORER.',
+    '',
+    'Règles spécifiques :',
+    '- Les mails envoyés par l’utilisateur ne doivent pas être ignorés automatiquement.',
+    '- Si un mail envoyé par l’utilisateur attend une réponse du comptable, d’une administration, d’un fournisseur ou d’un service utile => EN_ATTENTE.',
+    '- Si un mail envoyé par l’utilisateur transmet une pièce ou une information utile => A_TRAITER.',
+    '- hotmail.com et gmail.com ne sont jamais exclus globalement : décider selon le contenu.',
+    '- Amazon : A_IGNORER pour avis, recommandations, publicité ; A_TRAITER pour facture, reçu, commande utile, remboursement ou justificatif.',
+    '- Google : A_TRAITER pour Apps Script, erreur, sécurité, projet IA ; A_IGNORER pour notification générique.',
+    '- Doctolib ou rendez-vous médical avec date/heure/adresse => PERSONNEL, A_TRAITER, creation_calendar = true.',
+    '',
+    'Règles Calendar :',
+    '- creation_calendar = true uniquement si une date et une heure de rendez-vous sont clairement détectées.',
+    '- Ne jamais inventer de date, heure ou adresse.',
+    '- calendar_start_text doit contenir la date et heure de début en texte.',
+    '- calendar_end_text doit contenir la date et heure de fin en texte si disponible.',
+    '- calendar_location doit contenir l’adresse si disponible.',
+    '',
+    'Règles Task :',
+    '- creation_task = true si une action humaine ou un suivi est nécessaire.',
+    '- task_title doit être court et exploitable.',
+    '',
+    'Très important :',
+    '- Ne jamais écrire d’identifiant Calendar ou Task.',
+    '- Les IDs seront créés plus tard par des fonctions dédiées.',
+    '- Ici, tu proposes seulement les actions à créer.',
+    '',
+    'Données à analyser :',
+    JSON.stringify(payload),
+    '',
+    'Réponds uniquement en JSON strict, sans texte avant ni après :',
+    '{',
+    '  "famille": "COMPTABLE | ADMINISTRATIF | PERSONNEL | AUTRE",',
+    '  "decision": "A_IGNORER | A_TRAITER | A_VERIFIER | EN_ATTENTE",',
+    '  "commentaire": "explication courte et utile pour l’utilisateur",',
+    '  "regle": "règle éventuelle à créer ou vide",',
+    '  "analyse": "synthèse courte de la raison",',
+    '  "creation_task": false,',
+    '  "task_title": "",',
+    '  "creation_calendar": false,',
+    '  "calendar_title": "",',
+    '  "calendar_start_text": "",',
+    '  "calendar_end_text": "",',
+    '  "calendar_location": ""',
+    '}'
+  ].join('\\n');
+}
+
+/**
+ * Récupération robuste du fichier Google Sheet.
+ */
+function getSpreadsheetForComptaAdminIA_() {
+  var id = '';
+
+  if (typeof PROCESSING_CONFIG !== 'undefined' && PROCESSING_CONFIG.SPREADSHEET_ID) {
+    id = PROCESSING_CONFIG.SPREADSHEET_ID;
+  } else if (typeof Config !== 'undefined' && Config.SPREADSHEET_ID) {
+    id = Config.SPREADSHEET_ID;
+  }
+
+  if (!id) {
+    throw new Error('SPREADSHEET_ID absent dans PROCESSING_CONFIG ou Config.');
+  }
+
+  id = String(id).trim();
+
+  // Si jamais une URL complète est fournie, on extrait l’ID.
+  var match = id.match(/\/d\/([a-zA-Z0-9-_]+)/);
+
+  if (match && match[1]) {
+    id = match[1];
+  }
+
+  return SpreadsheetApp.openById(id);
+}
+
+/**
+ * Récupération clé OpenAI.
+ */
+function getOpenAIKeyForComptaAdmin_() {
+  return PropertiesService.getScriptProperties().getProperty('OPENAI_API_KEY') || '';
+}
+
+/**
+ * Normalise la décision IA.
+ */
+function normalizeIaDecision_(decision) {
+  var normalized = String(decision || '').trim().toUpperCase();
+
+  if (COMPTA_ADMIN_ALLOWED_DECISIONS.indexOf(normalized) === -1) {
+    return 'A_VERIFIER';
+  }
+
+  return normalized;
+}
+
+/**
+ * Limite les textes trop longs avant écriture dans Sheet.
+ */
+function truncateForSheet_(value, maxLength) {
+  var text = value === null || value === undefined ? '' : String(value);
+  return text.length > maxLength ? text.slice(0, maxLength) : text;
+}
+
+/**
+ * Construit une map nom de colonne => index JS.
+ */
+function buildHeaderMap_(headers) {
+  var map = {};
+
+  headers.forEach(function(header, index) {
+    map[String(header).trim()] = index;
+  });
+
+  return map;
+}
+function enrichirPayloadAvecGmail_(payload, lienGmail) {
+  var result = {
+    sujet_gmail: '',
+    expediteur_gmail: '',
+    destinataire_gmail: '',
+    extrait_gmail: '',
+    has_attachments: false,
+    noms_pieces_jointes: []
+  };
+
+  if (!lienGmail) {
+    return result;
+  }
+
+  var messageId = extraireMessageIdDepuisLienGmail_(lienGmail);
+  if (!messageId) {
+    return result;
+  }
+
+  try {
+    var message = GmailApp.getMessageById(messageId);
+
+    if (!message) {
+      return result;
+    }
+
+    result.sujet_gmail = truncateForSheet_(message.getSubject(), 300);
+    result.expediteur_gmail = truncateForSheet_(message.getFrom(), 300);
+    result.destinataire_gmail = truncateForSheet_(message.getTo(), 300);
+    result.extrait_gmail = truncateForSheet_(message.getPlainBody(), 1500);
+
+    var attachments = message.getAttachments() || [];
+    result.has_attachments = attachments.length > 0;
+    result.noms_pieces_jointes = attachments
+      .slice(0, 5)
+      .map(function(file) {
+        return truncateForSheet_(file.getName(), 150);
+      });
+
+    return result;
+  } catch (e) {
+    result.extrait_gmail = 'Erreur lecture Gmail : ' + String(e && e.message ? e.message : e);
+    return result;
+  }
+}
+
+function extraireMessageIdDepuisLienGmail_(lienGmail) {
+  var text = String(lienGmail || '').trim();
+
+  if (!text) {
+    return '';
+  }
+
+  var match = text.match(/#(?:all|inbox|sent|label\/[^/]+)\/([a-zA-Z0-9]+)/);
+
+  if (match && match[1]) {
+    return match[1];
+  }
+
+  var fallback = text.match(/([a-f0-9]{16,})/i);
+
+  if (fallback && fallback[1]) {
+    return fallback[1];
+  }
+
+  return '';
+}
+/**
+ * Post-traitement déterministe des résultats IA.
+ * Objectif : ne pas rater les événements évidents même si l'IA oublie creation_calendar.
+ */
+function postTraiterResultatIAPourActions_(result, payload) {
+  var combined = [
+    payload.domaine,
+    payload.action,
+    payload.commentaire_utilisateur,
+    payload.sujet_gmail,
+    payload.expediteur_gmail,
+    payload.extrait_gmail,
+    result.commentaire,
+    result.analyse,
+    result.regle
+  ].join(' ').toLowerCase();
+
+  var hasDateSignal =
+    /\b(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)\b/i.test(combined) ||
+    /\b\d{1,2}\s*(janvier|février|fevrier|mars|avril|mai|juin|juillet|août|aout|septembre|octobre|novembre|décembre|decembre)\b/i.test(combined) ||
+    /\b\d{1,2}[\/.-]\d{1,2}([\/.-]\d{2,4})?\b/i.test(combined);
+
+  var hasTimeSignal =
+    /\b\d{1,2}\s*h\s*\d{0,2}\b/i.test(combined) ||
+    /\b\d{1,2}:\d{2}\b/i.test(combined);
+
+  var hasEventSignal =
+    /rdv|rendez-vous|doctolib|doctissimo|consultation|médecin|medecin|kiné|kine|dentiste|ophtalmo|cabinet|zoom|visio|réunion|reunion|webinaire|conférence|conference/i.test(combined);
+
+  var hasLocationSignal =
+    /rue|avenue|boulevard|place|cabinet|zoom|visio|teams|meet|adresse/i.test(combined);
+
+  if (hasDateSignal && hasTimeSignal && hasEventSignal) {
+    result.creation_calendar = true;
+
+    if (!result.calendar_title) {
+      if (/doctolib|doctissimo|médecin|medecin|kiné|kine|dentiste|ophtalmo|santé|sante/i.test(combined)) {
+        result.calendar_title = 'RDV médical';
+      } else if (/zoom|visio|réunion|reunion|webinaire|conférence|conference/i.test(combined)) {
+        result.calendar_title = 'Réunion / événement';
+      } else {
+        result.calendar_title = 'Événement à planifier';
+      }
+    }
+
+    if (!result.calendar_start_text) {
+      result.calendar_start_text = extraireDateHeureTexte_(combined);
+    }
+
+    if (!result.calendar_location && hasLocationSignal) {
+      result.calendar_location = extraireLieuTexte_(combined);
+    }
+
+    if (result.decision === 'A_VERIFIER') {
+      result.decision = 'A_TRAITER';
+    }
+
+    if (!result.commentaire || result.commentaire.indexOf('rendez-vous') === -1) {
+      result.commentaire = result.commentaire
+        ? result.commentaire + ' Événement daté détecté.'
+        : 'Événement daté détecté à ajouter au calendrier.';
+    }
+  }
+
+  // La colonne Y doit rester une règle de classification, pas un stockage d'événement.
+  if (result.creation_calendar && result.regle && /date|heure|durée|duree|zoom|calendar|calendrier/i.test(result.regle)) {
+    result.regle = '';
+  }
+  // Forcer une règle durable en colonne Y quand l’action est claire.
+  // La colonne Y ne doit pas contenir une date, une heure ou une adresse.
+  // Elle doit contenir une règle réutilisable pour Domaines_Suivi / Classification.
+  if (result.creation_calendar && !result.regle) {
+    if (/doctolib|doctissimo|rdv|rendez-vous|médecin|medecin|kiné|kine|dentiste|ophtalmo|santé|sante/i.test(combined)) {
+      result.regle = 'KEEP_PERSONNEL_RDV_CALENDAR';
+    } else if (/zoom|visio|réunion|reunion|webinaire|conférence|conference|teams|meet/i.test(combined)) {
+      result.regle = 'KEEP_EVENT_WITH_DATE_TIME';
+    } else {
+      result.regle = 'KEEP_EVENT_WITH_DATE_TIME';
+    }
+  }
+
+  if (result.creation_task && !result.regle) {
+    if (result.famille === 'COMPTABLE') {
+      result.regle = 'KEEP_COMPTABLE_ACTION';
+    } else if (result.famille === 'ADMINISTRATIF') {
+      result.regle = 'KEEP_ADMIN_ACTION';
+    } else if (result.famille === 'PERSONNEL') {
+      result.regle = 'KEEP_PERSONNEL_ACTION';
+    } else {
+      result.regle = 'KEEP_ACTION_TO_REVIEW';
+    }
+  }
+
+  // Si la règle contient par erreur des détails de calendrier,
+  // on la remplace par une règle propre.
+  if (result.regle && /date\s*:|heure\s*:|durée\s*:|duree\s*:|lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche|\d{1,2}h|calendar ia/i.test(result.regle)) {
+    if (result.creation_calendar) {
+      result.regle = 'KEEP_EVENT_WITH_DATE_TIME';
+    } else {
+      result.regle = '';
+    }
+  }
+  return result;
+}
+
+/**
+ * Extraction simple d'une date/heure en texte.
+ * Ne transforme pas en date JS : on garde une chaîne lisible pour validation humaine.
+ */
+function extraireDateHeureTexte_(text) {
+  var patterns = [
+    /(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)[^.,;\n]{0,80}(\d{1,2}\s*h\s*\d{0,2}|\d{1,2}:\d{2})/i,
+    /(\d{1,2}\s*(janvier|février|fevrier|mars|avril|mai|juin|juillet|août|aout|septembre|octobre|novembre|décembre|decembre)[^.,;\n]{0,80}(\d{1,2}\s*h\s*\d{0,2}|\d{1,2}:\d{2}))/i,
+    /(\d{1,2}[\/.-]\d{1,2}([\/.-]\d{2,4})?[^.,;\n]{0,80}(\d{1,2}\s*h\s*\d{0,2}|\d{1,2}:\d{2}))/i
+  ];
+
+  for (var i = 0; i < patterns.length; i++) {
+    var match = String(text || '').match(patterns[i]);
+    if (match && match[0]) {
+      return truncateForSheet_(match[0], 250);
+    }
+  }
+
+  return '';
+}
+
+/**
+ * Extraction très simple du lieu.
+ */
+function extraireLieuTexte_(text) {
+  var patterns = [
+    /(\d{1,4}\s+(rue|avenue|boulevard|place|impasse|chemin)[^.,;\n]{0,100})/i,
+    /(zoom|teams|google meet|meet|visio)[^.,;\n]{0,80}/i
+  ];
+
+  for (var i = 0; i < patterns.length; i++) {
+    var match = String(text || '').match(patterns[i]);
+    if (match && match[0]) {
+      return truncateForSheet_(match[0], 250);
+    }
+  }
+
+  return '';
+}
