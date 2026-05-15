@@ -1,0 +1,98 @@
+/**
+ * Application prudente des décisions IA évidentes dans 02_Actions.
+ */
+
+/**
+ * Applique uniquement les décisions IA évidentes sur les lignes encore ouvertes.
+ */
+function appliquerDecisionsIAEvidentes() {
+  Logger.log('[Décisions IA] Début appliquerDecisionsIAEvidentes');
+
+  var ss = getSpreadsheet_();
+  var sheet = ss.getSheetByName(COMPTA_ADMIN_ACTIONS_SHEET_NAME);
+  if (!sheet) {
+    Logger.log('[Décisions IA] Onglet 02_Actions introuvable, arrêt');
+    return;
+  }
+
+  ensureSheetSizeForFastView_(sheet, COMPTA_ADMIN_FAST_MAX_ROWS, COMPTA_ADMIN_ACTIONS_MAX_COLS);
+  ensureActionIaHeaders_(sheet);
+
+  var values = sheet.getRange(1, 1, COMPTA_ADMIN_FAST_MAX_ROWS, COMPTA_ADMIN_ACTIONS_MAX_COLS).getValues();
+  var headers = buildHeaderIndex_(values[0]);
+  var statutColumn = getColumnByHeader_(headers, 'Statut_action');
+  var commentaireColumn = getColumnByHeader_(headers, 'Commentaire');
+  var updatedStatuses = 0;
+  var updatedComments = 0;
+  var ignoredRows = 0;
+
+  for (var i = 1; i < values.length; i++) {
+    var row = values[i];
+    var statut = getByHeader_(row, headers, 'Statut_action');
+    if (normalizeTextForComptaAdmin_(statut) !== normalizeTextForComptaAdmin_('Ouvert')) {
+      ignoredRows++;
+      continue;
+    }
+
+    var rawDecision = getByHeader_(row, headers, 'Décision_IA_proposée');
+    if (!hasValue_(rawDecision)) {
+      continue;
+    }
+
+    var decision = normalizeIaDecision_(rawDecision);
+    var commentaireIa = getByHeader_(row, headers, 'Commentaire_IA');
+    var currentComment = getByHeader_(row, headers, 'Commentaire');
+    var newStatus = '';
+    var commentPrefix = '';
+
+    if (decision === 'A_IGNORER') {
+      newStatus = 'À ignorer';
+      commentPrefix = 'Auto IA : ';
+    } else if (decision === 'EN_ATTENTE') {
+      newStatus = 'En attente';
+      commentPrefix = 'Auto IA attente : ';
+    } else if (decision === 'A_TRAITER') {
+      commentPrefix = 'À contrôler IA : ';
+    } else if (decision === 'A_VERIFIER') {
+      commentPrefix = 'À vérifier IA : ';
+    } else {
+      continue;
+    }
+
+    if (newStatus && statutColumn > 0) {
+      sheet.getRange(i + 1, statutColumn).setValue(newStatus);
+      updatedStatuses++;
+    }
+
+    if (commentPrefix && commentaireColumn > 0) {
+      var commentToAppend = commentPrefix + (hasValue_(commentaireIa) ? commentaireIa : 'Décision ' + decision);
+      sheet.getRange(i + 1, commentaireColumn).setValue(appendCommentForComptaAdmin_(currentComment, commentToAppend));
+      updatedComments++;
+    }
+  }
+
+  Logger.log('[Décisions IA] Statuts modifiés : ' + updatedStatuses);
+  Logger.log('[Décisions IA] Commentaires complétés : ' + updatedComments);
+  Logger.log('[Décisions IA] Lignes ignorées car non ouvertes : ' + ignoredRows);
+  Logger.log('[Décisions IA] Fin appliquerDecisionsIAEvidentes');
+}
+
+function appendCommentForComptaAdmin_(currentComment, commentToAppend) {
+  if (!hasValue_(currentComment)) {
+    return commentToAppend;
+  }
+
+  if (String(currentComment).indexOf(commentToAppend) !== -1) {
+    return currentComment;
+  }
+
+  return currentComment + ' | ' + commentToAppend;
+}
+
+function getColumnByHeader_(headerIndex, headerName) {
+  var key = normalizeHeaderForComptaAdmin_(headerName);
+  if (!headerIndex.hasOwnProperty(key)) {
+    return 0;
+  }
+  return headerIndex[key] + 1;
+}
