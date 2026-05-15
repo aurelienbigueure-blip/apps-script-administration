@@ -1,0 +1,378 @@
+/**
+ * Interface et mise en forme rapides pour le classeur Pilotage_Compta_Admin.
+ * Ces fonctions ne modifient pas les données métier et ne lancent aucun appel OpenAI/Gmail/Drive.
+ */
+
+var COMPTA_ADMIN_ACTIONS_SHEET_NAME = '02_Actions';
+var COMPTA_ADMIN_TRIAGE_IA_SHEET_NAME = '14_Triage_IA';
+var COMPTA_ADMIN_FAST_MAX_ROWS = 300;
+var COMPTA_ADMIN_ACTIONS_MAX_COLS = 26;
+
+
+/**
+ * Mise en forme rapide de production, appelée depuis le menu.
+ */
+function setupMiseEnFormeRapideComptaAdmin() {
+  Logger.log('[Mise en forme rapide] Début');
+  setupPerformanceComptaAdmin();
+  Logger.log('[Mise en forme rapide] Fin');
+}
+
+/**
+ * Rend 02_Actions plus léger à utiliser en limitant les filtres, formats et colonnes visibles.
+ */
+function setupPerformanceComptaAdmin() {
+  Logger.log('Début setup performance Compta Admin');
+
+  const ss = SpreadsheetApp.openById(PROCESSING_CONFIG.SPREADSHEET_ID);
+  const actionsSheet = ss.getSheetByName('02_Actions');
+  const domainesSheet = ss.getSheetByName('12_Domaines_Suivi');
+  const triageSheet = ss.getSheetByName('14_Triage_IA');
+
+  if (!actionsSheet) {
+    throw new Error('Onglet 02_Actions introuvable.');
+  }
+
+  if (triageSheet) {
+    triageSheet.hideSheet();
+    Logger.log('Onglet 14_Triage_IA masqué.');
+  }
+
+  actionsSheet.setFrozenRows(1);
+  appliquerColonnesVisiblesActions_(actionsSheet);
+  recreerFiltreActions_(actionsSheet);
+
+  const lastRowActions = Math.min(Math.max(actionsSheet.getLastRow(), 1), 300);
+
+  actionsSheet.getRange(1, 1, 1, 26)
+    .setFontWeight('bold')
+    .setBackground('#D9EAF7');
+
+  if (lastRowActions > 1) {
+    actionsSheet.getRange(2, 8, lastRowActions - 1, 1).setWrap(true);
+    actionsSheet.getRange(2, 19, lastRowActions - 1, 1).setWrap(true);
+    actionsSheet.getRange(2, 24, lastRowActions - 1, 3).setWrap(true);
+  }
+
+  if (domainesSheet) {
+    const lastRowDomaines = Math.min(Math.max(domainesSheet.getLastRow(), 1), 300);
+    const lastColDomaines = Math.min(Math.max(domainesSheet.getLastColumn(), 1), 10);
+
+    domainesSheet.setFrozenRows(1);
+    domainesSheet.getRange(1, 1, 1, lastColDomaines)
+      .setFontWeight('bold')
+      .setBackground('#D9EAF7');
+
+    const existingFilter = domainesSheet.getFilter();
+    if (existingFilter) {
+      existingFilter.remove();
+    }
+
+    domainesSheet.getRange(1, 1, lastRowDomaines, lastColDomaines).createFilter();
+  }
+
+  Logger.log('Fin setup performance Compta Admin');
+}
+
+/**
+ * Répare l'interface simple sans modifier les données ni les statuts/commentaires.
+ */
+function reparerInterfaceComptaAdmin() {
+  Logger.log('Début réparation interface Compta Admin');
+
+  const ss = SpreadsheetApp.openById(PROCESSING_CONFIG.SPREADSHEET_ID);
+  const actionsSheet = ss.getSheetByName('02_Actions');
+
+  if (!actionsSheet) {
+    throw new Error('Onglet 02_Actions introuvable.');
+  }
+
+  const triageSheet = ss.getSheetByName('14_Triage_IA');
+  if (triageSheet) {
+    triageSheet.hideSheet();
+    Logger.log('Onglet 14_Triage_IA masqué.');
+  }
+
+  actionsSheet.setFrozenRows(1);
+
+  appliquerColonnesVisiblesActions_(actionsSheet);
+  recreerFiltreActions_(actionsSheet);
+
+  const lastRow = Math.min(Math.max(actionsSheet.getLastRow(), 1), 300);
+
+  actionsSheet.getRange(1, 1, 1, 26)
+    .setFontWeight('bold')
+    .setBackground('#D9EAF7');
+
+  if (lastRow > 1) {
+    actionsSheet.getRange(2, 8, lastRow - 1, 1).setWrap(true);   // H Action
+    actionsSheet.getRange(2, 19, lastRow - 1, 1).setWrap(true);  // S Commentaire
+    actionsSheet.getRange(2, 24, lastRow - 1, 3).setWrap(true);  // X:Y:Z IA
+  }
+
+  actionsSheet.setColumnWidth(5, 160);   // Domaine
+  actionsSheet.setColumnWidth(8, 420);   // Action
+  actionsSheet.setColumnWidth(9, 100);   // Priorité
+  actionsSheet.setColumnWidth(12, 130);  // Statut_action
+  actionsSheet.setColumnWidth(13, 180);  // Lien_Gmail
+  actionsSheet.setColumnWidth(19, 280);  // Commentaire
+  actionsSheet.setColumnWidth(20, 150);  // Dernière_maj
+  actionsSheet.setColumnWidth(23, 160);  // Décision_IA
+  actionsSheet.setColumnWidth(24, 320);  // Commentaire_IA
+  actionsSheet.setColumnWidth(25, 320);  // Règle IA
+  actionsSheet.setColumnWidth(26, 320);  // Analyse_IA
+
+  Logger.log('Fin réparation interface Compta Admin');
+}
+
+/**
+ * Audite les colonnes utiles de 02_Actions et 12_Domaines_Suivi sans modifier les données.
+ */
+function auditColonnesComptaAdmin() {
+  Logger.log('[Audit colonnes] Début');
+
+  var ss = getSpreadsheet_();
+  auditSheetHeaders_(ss, COMPTA_ADMIN_ACTIONS_SHEET_NAME, [
+    'Domaine',
+    'Action',
+    'Priorité',
+    'Statut_action',
+    'Lien_Gmail',
+    'Commentaire',
+    'Dernière_maj',
+    'Décision_IA_proposée',
+    'Commentaire_IA',
+    'Règle_correction_proposée',
+    'Analyse_IA'
+  ], COMPTA_ADMIN_ACTIONS_MAX_COLS);
+
+  auditSheetHeaders_(ss, '12_Domaines_Suivi', [
+    'Date_ajout',
+    'Domaine_ou_motif',
+    'Type',
+    'Décision',
+    'Règle_cible',
+    'Statut_règle',
+    'Priorité',
+    'Source',
+    'Commentaire',
+    'Dernière_maj'
+  ], 20);
+
+  Logger.log('[Audit colonnes] Fin');
+}
+
+function auditSheetHeaders_(ss, sheetName, requiredHeaders, maxColumnsToRead) {
+  var sheet = ss.getSheetByName(sheetName);
+  if (!sheet) {
+    Logger.log('[Audit colonnes] Onglet absent : ' + sheetName);
+    return;
+  }
+
+  var columns = Math.max(maxColumnsToRead, requiredHeaders.length);
+  ensureSheetSizeForFastView_(sheet, 1, columns);
+  var headerRow = sheet.getRange(1, 1, 1, columns).getValues()[0];
+  var headerIndex = buildHeaderIndex_(headerRow);
+  var missing = [];
+
+  requiredHeaders.forEach(function(header) {
+    if (!headerIndex.hasOwnProperty(normalizeHeaderForComptaAdmin_(header))) {
+      missing.push(header);
+    }
+  });
+
+  if (missing.length === 0) {
+    Logger.log('[Audit colonnes] ' + sheetName + ' : OK');
+  } else {
+    Logger.log('[Audit colonnes] ' + sheetName + ' : colonnes manquantes = ' + missing.join(', '));
+  }
+}
+
+function recreateActionsFastFilter_(sheet) {
+  removeExistingFilter_(sheet);
+  sheet.getRange(1, 1, COMPTA_ADMIN_FAST_MAX_ROWS, COMPTA_ADMIN_ACTIONS_MAX_COLS).createFilter();
+}
+
+function hideAllThenShowUsefulActionColumns_(sheet) {
+  sheet.showColumns(1, COMPTA_ADMIN_ACTIONS_MAX_COLS);
+  sheet.hideColumns(1, COMPTA_ADMIN_ACTIONS_MAX_COLS);
+
+  var visibleColumns = [5, 8, 9, 12, 13, 19, 20, 23, 24, 25, 26];
+  visibleColumns.forEach(function(column) {
+    sheet.showColumns(column);
+  });
+}
+
+function applyLightActionsFormatting_(sheet) {
+  var headerRange = sheet.getRange(1, 1, 1, COMPTA_ADMIN_ACTIONS_MAX_COLS);
+  headerRange.setFontWeight('bold').setBackground('#f1f3f4');
+
+  sheet.getRange(1, 1, COMPTA_ADMIN_FAST_MAX_ROWS, COMPTA_ADMIN_ACTIONS_MAX_COLS)
+    .setVerticalAlignment('top');
+
+  [8, 19, 23, 24, 25, 26].forEach(function(column) {
+    sheet.getRange(1, column, COMPTA_ADMIN_FAST_MAX_ROWS, 1).setWrap(true);
+  });
+
+  sheet.setRowHeights(1, COMPTA_ADMIN_FAST_MAX_ROWS, 24);
+  sheet.setColumnWidth(5, 140);
+  sheet.setColumnWidth(8, 300);
+  sheet.setColumnWidth(9, 90);
+  sheet.setColumnWidth(12, 115);
+  sheet.setColumnWidth(13, 170);
+  sheet.setColumnWidth(19, 280);
+  sheet.setColumnWidth(20, 145);
+  sheet.setColumnWidth(23, 155);
+  sheet.setColumnWidth(24, 280);
+  sheet.setColumnWidth(25, 260);
+  sheet.setColumnWidth(26, 320);
+}
+
+function hideTriageIaSheetIfExists_(ss) {
+  var triageSheet = ss.getSheetByName(COMPTA_ADMIN_TRIAGE_IA_SHEET_NAME);
+  if (triageSheet && ss.getSheets().length > 1) {
+    triageSheet.hideSheet();
+  }
+}
+
+function ensureActionIaHeaders_(sheet) {
+  var headers = sheet.getRange(1, 1, 1, COMPTA_ADMIN_ACTIONS_MAX_COLS).getValues()[0];
+  var expectedHeaders = {
+    21: 'Explication_action',
+    22: 'Pourquoi_remonté',
+    23: 'Décision_IA_proposée',
+    24: 'Commentaire_IA',
+    25: 'Règle_correction_proposée',
+    26: 'Analyse_IA'
+  };
+  var changed = false;
+
+  Object.keys(expectedHeaders).forEach(function(columnText) {
+    var column = Number(columnText);
+    if (!hasValue_(headers[column - 1])) {
+      headers[column - 1] = expectedHeaders[column];
+      changed = true;
+    }
+  });
+
+  if (changed) {
+    sheet.getRange(1, 1, 1, COMPTA_ADMIN_ACTIONS_MAX_COLS).setValues([headers]);
+  }
+}
+
+function ensureSheetSizeForFastView_(sheet, minRows, minColumns) {
+  if (sheet.getMaxRows() < minRows) {
+    sheet.insertRowsAfter(sheet.getMaxRows(), minRows - sheet.getMaxRows());
+  }
+
+  if (sheet.getMaxColumns() < minColumns) {
+    sheet.insertColumnsAfter(sheet.getMaxColumns(), minColumns - sheet.getMaxColumns());
+  }
+}
+
+function removeExistingFilter_(sheet) {
+  var filter = sheet.getFilter();
+  if (filter) {
+    filter.remove();
+  }
+}
+
+function buildHeaderIndex_(headerRow) {
+  var index = {};
+  for (var i = 0; i < headerRow.length; i++) {
+    var key = normalizeHeaderForComptaAdmin_(headerRow[i]);
+    if (key) {
+      index[key] = i;
+    }
+  }
+  return index;
+}
+
+function getByHeader_(row, headerIndex, headerName) {
+  var key = normalizeHeaderForComptaAdmin_(headerName);
+  if (!headerIndex.hasOwnProperty(key)) {
+    return '';
+  }
+  return row[headerIndex[key]];
+}
+
+function normalizeHeaderForComptaAdmin_(value) {
+  return normalizeTextForComptaAdmin_(value).replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+}
+
+function normalizeTextForComptaAdmin_(value) {
+  if (value === null || value === undefined) {
+    return '';
+  }
+
+  return String(value)
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function hasValue_(value) {
+  return value !== null && value !== undefined && String(value).trim() !== '';
+}
+function appliquerColonnesVisiblesActions_(sheet) {
+  const maxCols = sheet.getMaxColumns();
+
+  // Sécurité : on réaffiche tout avant de masquer proprement.
+  sheet.showColumns(1, maxCols);
+
+  // Colonnes visibles dans 02_Actions :
+  // E Domaine
+  // H Action
+  // I Priorité
+  // L Statut_action
+  // M Lien_Gmail
+  // S Commentaire
+  // T Dernière_maj
+  // W Décision_IA_proposée
+  // X Commentaire_IA
+  // Y Règle_correction_proposée
+  // Z Analyse_IA
+  const visibles = {
+    5: true,
+    8: true,
+    9: true,
+    12: true,
+    13: true,
+    19: true,
+    20: true,
+    23: true,
+    24: true,
+    25: true,
+    26: true
+  };
+
+  if (maxCols < 26) {
+    Logger.log('Masquage annulé : 02_Actions a moins de 26 colonnes.');
+    return;
+  }
+
+  for (let col = 1; col <= maxCols; col++) {
+    if (!visibles[col]) {
+      sheet.hideColumns(col);
+    }
+  }
+
+  Logger.log('Colonnes visibles appliquées dans 02_Actions.');
+}
+
+function recreerFiltreActions_(sheet) {
+  const maxCols = sheet.getMaxColumns();
+  const lastRow = Math.min(Math.max(sheet.getLastRow(), 1), 300);
+
+  const existingFilter = sheet.getFilter();
+  if (existingFilter) {
+    existingFilter.remove();
+  }
+
+  if (maxCols >= 26 && lastRow >= 1) {
+    sheet.getRange(1, 1, lastRow, 26).createFilter();
+    Logger.log('Filtre recréé sur 02_Actions A1:Z' + lastRow);
+  }
+}
