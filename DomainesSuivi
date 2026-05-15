@@ -1,0 +1,331 @@
+/**
+ * Exploitation légère des propositions IA de 02_Actions pour alimenter 12_Domaines_Suivi.
+ * Aucune suppression de règle existante et aucun appel à OpenAI, Gmail ou Drive.
+ */
+
+var COMPTA_ADMIN_DOMAINES_SUIVI_SHEET_NAME = '12_Domaines_Suivi';
+var COMPTA_ADMIN_DOMAINES_HEADERS = [
+  'Date_ajout',
+  'Domaine_ou_motif',
+  'Type',
+  'Décision',
+  'Règle_cible',
+  'Statut_règle',
+  'Priorité',
+  'Source',
+  'Commentaire',
+  'Dernière_maj'
+];
+
+/**
+ * Met à jour 12_Domaines_Suivi à partir des statuts et propositions IA de 02_Actions!A1:Z300.
+ */
+function majDomainesSuiviDepuisActions() {
+  Logger.log('[Domaines Suivi] Début majDomainesSuiviDepuisActions');
+
+  var ss = getSpreadsheet_();
+  var actionSheet = ss.getSheetByName(COMPTA_ADMIN_ACTIONS_SHEET_NAME);
+  if (!actionSheet) {
+    Logger.log('[Domaines Suivi IA] Onglet 02_Actions introuvable, arrêt');
+    return;
+  }
+
+  ensureSheetSizeForFastView_(actionSheet, COMPTA_ADMIN_FAST_MAX_ROWS, COMPTA_ADMIN_ACTIONS_MAX_COLS);
+  var actionValues = actionSheet.getRange(1, 1, COMPTA_ADMIN_FAST_MAX_ROWS, COMPTA_ADMIN_ACTIONS_MAX_COLS).getValues();
+  var actionHeaders = buildHeaderIndex_(actionValues[0]);
+  Logger.log('[Domaines Suivi IA] Lecture limitée à 02_Actions!A1:Z300');
+
+  var suiviSheet = getOrCreateDomainesSuiviSheet_(ss);
+  var suiviHeaders = ensureDomainesSuiviHeaders_(suiviSheet);
+  var existingKeys = buildExistingDomainesKeys_(suiviSheet, suiviHeaders);
+  Logger.log('[Domaines Suivi IA] Clés existantes chargées : ' + Object.keys(existingKeys).length);
+
+  var rowsToAppend = [];
+  var now = new Date();
+
+  for (var i = 1; i < actionValues.length; i++) {
+    var actionRow = actionValues[i];
+    var domaine = getByHeader_(actionRow, actionHeaders, 'Domaine');
+    var statut = getByHeader_(actionRow, actionHeaders, 'Statut_action');
+    var commentaire = getByHeader_(actionRow, actionHeaders, 'Commentaire');
+    var decisionIa = getByHeader_(actionRow, actionHeaders, 'Décision_IA_proposée');
+    var commentaireIa = getByHeader_(actionRow, actionHeaders, 'Commentaire_IA');
+    var regleIa = getByHeader_(actionRow, actionHeaders, 'Règle_correction_proposée');
+    var analyseIa = getByHeader_(actionRow, actionHeaders, 'Analyse_IA');
+    var combinedText = [commentaire, decisionIa, commentaireIa, regleIa, analyseIa].join(' ');
+    var normalizedStatut = normalizeTextForComptaAdmin_(statut);
+
+    if ((normalizedStatut === normalizeTextForComptaAdmin_('À ignorer') || normalizeTextForComptaAdmin_(decisionIa) === 'a_ignorer') && hasValue_(domaine)) {
+      addDomainesCandidate_(rowsToAppend, existingKeys, suiviHeaders, now, {
+        domaineOuMotif: domaine,
+        type: 'Domaine',
+        decision: 'Exclure',
+        regleCible: '',
+        statutRegle: 'À ajouter Classification.gs',
+        priorite: 'Moyenne',
+        source: '02_Actions',
+        commentaire: joinNonEmpty_([commentaire, commentaireIa, regleIa], ' | ')
+      });
+    }
+
+    if ((normalizedStatut === normalizeTextForComptaAdmin_('Traité') || normalizeTextForComptaAdmin_(decisionIa) === 'a_traiter') && hasValue_(domaine)) {
+      addDomainesCandidate_(rowsToAppend, existingKeys, suiviHeaders, now, {
+        domaineOuMotif: domaine,
+        type: 'Domaine',
+        decision: 'Conserver / vérifier',
+        regleCible: '',
+        statutRegle: 'À ajouter Classification.gs',
+        priorite: containsUsefulSignal_(combinedText) ? 'Haute' : 'Moyenne',
+        source: '02_Actions',
+        commentaire: joinNonEmpty_([commentaire, commentaireIa, regleIa, analyseIa], ' | ')
+      });
+    }
+  }
+
+  getSpecificDomainesSuiviRules_().forEach(function(rule) {
+    addDomainesCandidate_(rowsToAppend, existingKeys, suiviHeaders, now, rule);
+  });
+  Logger.log('[Domaines Suivi IA] Candidats à ajouter : ' + rowsToAppend.length);
+
+  if (rowsToAppend.length > 0) {
+    suiviSheet.getRange(suiviSheet.getLastRow() + 1, 1, rowsToAppend.length, suiviHeaders.length).setValues(rowsToAppend);
+    Logger.log('[Domaines Suivi IA] Lignes ajoutées : ' + rowsToAppend.length);
+  } else {
+    Logger.log('[Domaines Suivi IA] Aucune ligne nouvelle à ajouter');
+  }
+
+  Logger.log('[Domaines Suivi] Fin majDomainesSuiviDepuisActions');
+}
+
+// OBSOLETE / TEST - NE PAS UTILISER
+// Conservée temporairement pour éviter une rupture de référence.
+function majDomainesSuiviDepuisActionsIA() {
+  return majDomainesSuiviDepuisActions();
+}
+
+function getOrCreateDomainesSuiviSheet_(ss) {
+  var sheet = ss.getSheetByName(COMPTA_ADMIN_DOMAINES_SUIVI_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(COMPTA_ADMIN_DOMAINES_SUIVI_SHEET_NAME);
+    Logger.log('[Domaines Suivi IA] Onglet 12_Domaines_Suivi créé');
+  }
+  return sheet;
+}
+
+function ensureDomainesSuiviHeaders_(sheet) {
+  ensureSheetSizeForFastView_(sheet, 2, COMPTA_ADMIN_DOMAINES_HEADERS.length);
+
+  var lastColumn = Math.max(sheet.getLastColumn(), COMPTA_ADMIN_DOMAINES_HEADERS.length);
+  var currentHeaders = sheet.getRange(1, 1, 1, lastColumn).getValues()[0];
+  var normalized = buildHeaderIndex_(currentHeaders);
+
+  if (sheet.getLastRow() === 0 || currentHeaders.join('').trim() === '') {
+    sheet.getRange(1, 1, 1, COMPTA_ADMIN_DOMAINES_HEADERS.length).setValues([COMPTA_ADMIN_DOMAINES_HEADERS]);
+    sheet.setFrozenRows(1);
+    Logger.log('[Domaines Suivi IA] En-têtes minimum créés');
+    return COMPTA_ADMIN_DOMAINES_HEADERS.slice();
+  }
+
+  var headers = currentHeaders.slice();
+  COMPTA_ADMIN_DOMAINES_HEADERS.forEach(function(requiredHeader) {
+    var key = normalizeHeaderForComptaAdmin_(requiredHeader);
+    if (!normalized.hasOwnProperty(key)) {
+      headers.push(requiredHeader);
+      normalized[key] = headers.length - 1;
+    }
+  });
+
+  if (headers.length > currentHeaders.length) {
+    ensureSheetSizeForFastView_(sheet, 2, headers.length);
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    Logger.log('[Domaines Suivi IA] Colonnes manquantes ajoutées aux en-têtes existants');
+  }
+
+  sheet.setFrozenRows(1);
+  return headers;
+}
+
+function buildExistingDomainesKeys_(sheet, headers) {
+  var keys = {};
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) {
+    return keys;
+  }
+
+  var data = sheet.getRange(2, 1, lastRow - 1, headers.length).getValues();
+  var headerIndex = buildHeaderIndex_(headers);
+  data.forEach(function(row) {
+    var key = buildDomainesDedupeKey_(
+      getByHeader_(row, headerIndex, 'Domaine_ou_motif'),
+      getByHeader_(row, headerIndex, 'Décision'),
+      getByHeader_(row, headerIndex, 'Règle_cible')
+    );
+    if (key !== '||') {
+      keys[key] = true;
+    }
+  });
+  return keys;
+}
+
+function addDomainesCandidate_(rowsToAppend, existingKeys, headers, now, candidate) {
+  var key = buildDomainesDedupeKey_(candidate.domaineOuMotif, candidate.decision, candidate.regleCible);
+  if (existingKeys[key]) {
+    return;
+  }
+
+  existingKeys[key] = true;
+  var row = new Array(headers.length).fill('');
+  var headerIndex = buildHeaderIndex_(headers);
+
+  setByHeader_(row, headerIndex, 'Date_ajout', now);
+  setByHeader_(row, headerIndex, 'Domaine_ou_motif', candidate.domaineOuMotif || '');
+  setByHeader_(row, headerIndex, 'Type', candidate.type || 'Motif');
+  setByHeader_(row, headerIndex, 'Décision', candidate.decision || '');
+  setByHeader_(row, headerIndex, 'Règle_cible', candidate.regleCible || '');
+  setByHeader_(row, headerIndex, 'Statut_règle', candidate.statutRegle || 'À ajouter Classification.gs');
+  setByHeader_(row, headerIndex, 'Priorité', candidate.priorite || 'Moyenne');
+  setByHeader_(row, headerIndex, 'Source', candidate.source || '02_Actions');
+  setByHeader_(row, headerIndex, 'Commentaire', candidate.commentaire || '');
+  setByHeader_(row, headerIndex, 'Dernière_maj', now);
+
+  rowsToAppend.push(row);
+}
+
+function setByHeader_(row, headerIndex, headerName, value) {
+  var key = normalizeHeaderForComptaAdmin_(headerName);
+  if (headerIndex.hasOwnProperty(key)) {
+    row[headerIndex[key]] = value;
+  }
+}
+
+function buildDomainesDedupeKey_(domaineOuMotif, decision, regleCible) {
+  return [domaineOuMotif, decision, regleCible]
+    .map(function(value) { return normalizeTextForComptaAdmin_(value); })
+    .join('|');
+}
+
+function containsUsefulSignal_(text) {
+  var normalized = normalizeTextForComptaAdmin_(text);
+  var signals = [
+    'facture',
+    'devis',
+    'compta',
+    'comptable',
+    'wecasa',
+    'urssaf',
+    'msa',
+    'colissimo',
+    'booking',
+    'pulse',
+    'google apps script',
+    'projet ia',
+    'rdv kine'
+  ];
+
+  return signals.some(function(signal) {
+    return normalized.indexOf(normalizeTextForComptaAdmin_(signal)) !== -1;
+  });
+}
+
+function extractUsefulSignalMotif_(text) {
+  var normalized = normalizeTextForComptaAdmin_(text);
+  var signals = ['facture', 'devis', 'compta', 'comptable', 'wecasa', 'urssaf', 'msa', 'colissimo', 'booking', 'pulse', 'google apps script', 'projet ia', 'rdv kine'];
+
+  for (var i = 0; i < signals.length; i++) {
+    if (normalized.indexOf(normalizeTextForComptaAdmin_(signals[i])) !== -1) {
+      return signals[i];
+    }
+  }
+  return 'Signal utile IA';
+}
+
+function getSpecificDomainesSuiviRules_() {
+  return [
+    {
+      domaineOuMotif: 'hotmail.com',
+      type: 'Domaine',
+      decision: 'Exclure conditionnellement',
+      regleCible: 'EXCL_HOTMAIL_MARKETING_JOB_TRAVEL',
+      statutRegle: 'À ajouter Classification.gs',
+      priorite: 'Moyenne',
+      source: 'Analyse IA récente',
+      commentaire: 'Exclure seulement si publicité, newsletter, promotion, voyage marketing, offre d’emploi, candidature ou recrutement. Ne pas exclure si Wecasa, URSSAF, MSA, Booking, PULSE, devis, facture, reçu, comptable, RDV santé / kiné.'
+    },
+    {
+      domaineOuMotif: 'boxraw.com',
+      type: 'Domaine',
+      decision: 'Exclure',
+      regleCible: 'EXCL_MARKETING_BRANDS',
+      statutRegle: 'À ajouter Classification.gs',
+      priorite: 'Moyenne',
+      source: 'Analyse IA récente',
+      commentaire: 'Domaine marketing / marque commerciale.'
+    },
+    {
+      domaineOuMotif: 'alerte + annonce immobilière',
+      type: 'Motif',
+      decision: 'Exclure',
+      regleCible: 'EXCL_ALERTS_IMMO',
+      statutRegle: 'À ajouter Classification.gs',
+      priorite: 'Moyenne',
+      source: 'Analyse IA récente',
+      commentaire: 'Alertes annonces immobilières à exclure sauf document contractuel ou administratif.'
+    },
+    {
+      domaineOuMotif: 'ur + wecasa',
+      type: 'Motif',
+      decision: 'Conserver',
+      regleCible: 'KEEP_WECASA_PAYMENT',
+      statutRegle: 'À ajouter Classification.gs',
+      priorite: 'Haute',
+      source: 'Analyse IA récente',
+      commentaire: 'Mails Wecasa avec montant détecté ; à conserver comme justificatif / suivi administratif.'
+    },
+    {
+      domaineOuMotif: 'google.com + IA / Apps Script',
+      type: 'Motif',
+      decision: 'Conserver conditionnellement',
+      regleCible: 'KEEP_GOOGLE_APPS_SCRIPT_TECH',
+      statutRegle: 'À ajouter Classification.gs',
+      priorite: 'Haute',
+      source: 'Analyse IA récente',
+      commentaire: 'Conserver les alertes techniques liées à Apps Script / IA ; exclure les notifications Google génériques.'
+    },
+    {
+      domaineOuMotif: 'amazon.fr',
+      type: 'Domaine',
+      decision: 'Exclure conditionnellement',
+      regleCible: 'EXCL_AMAZON_MARKETING_AVIS',
+      statutRegle: 'À ajouter Classification.gs',
+      priorite: 'Moyenne',
+      source: 'Analyse IA récente',
+      commentaire: 'Exclure les avis produit, recommandations et publicités. Conserver factures, commandes utiles, reçus, justificatifs.'
+    },
+    {
+      domaineOuMotif: 'new',
+      type: 'Motif',
+      decision: 'Exclure conditionnellement',
+      regleCible: 'EXCL_NEW_MARKETING',
+      statutRegle: 'À ajouter Classification.gs',
+      priorite: 'Moyenne',
+      source: 'Analyse IA récente',
+      commentaire: 'Exclure si publicité, promotion, newsletter.'
+    },
+    {
+      domaineOuMotif: 'notif-coli / Colissimo',
+      type: 'Motif',
+      decision: 'Conserver conditionnellement',
+      regleCible: 'KEEP_COLISSIMO_USEFUL',
+      statutRegle: 'À ajouter Classification.gs',
+      priorite: 'Moyenne',
+      source: 'Analyse IA récente',
+      commentaire: 'Conserver si livraison utile / justificatif ; ignorer si notification sans intérêt administratif.'
+    }
+  ];
+}
+
+function joinNonEmpty_(values, separator) {
+  return values.filter(function(value) {
+    return hasValue_(value);
+  }).join(separator);
+}
